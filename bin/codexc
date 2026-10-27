@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""
+codexc - Gestor multi-cuenta, aislamiento y rotación de cuotas para OpenAI Codex CLI.
+Permite ejecutar múltiples cuentas de Codex en paralelo sin colisiones ni agotamiento cruzado.
+"""
+
+import sys
+import os
+import json
+import time
+import argparse
+import urllib.request
+import urllib.error
+import shutil
+import subprocess
+import re
+from datetime import datetime, timezone
+
+# Rutas estándar del sistema
+REAL_HOME = os.environ.get("CODEX_REAL_HOME") or "/home/aidev"
+CODEXC_DIR = os.path.join(REAL_HOME, ".codexc")
+HOMES_DIR = os.path.join(REAL_HOME, ".codexc_homes")
+ACTIVE_FILE = os.path.join(CODEXC_DIR, "active")
+DEFAULT_FILE = os.path.join(CODEXC_DIR, "default")
+SYSTEM_CODEX_DIR = os.path.join(REAL_HOME, ".codex")
+CENTRAL_CODEX_BIN = os.path.join(SYSTEM_CODEX_DIR, "packages", "standalone", "current", "bin", "codex")
+LOCAL_BIN_DIR = os.path.join(REAL_HOME, ".local", "bin")
+
+CACHE_TTL_SECONDS = 60
+
+# Códigos ANSI para formato visual en terminal
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[2m"
+C_RED = "\033[31m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_BLUE = "\033[34m"
+C_MAGENTA = "\033[35m"
+C_CYAN = "\033[36m"
+C_WHITE = "\033[37m"
+C_BG_GREEN = "\033[42m\033[30m"
+C_BG_BLUE = "\033[44m\033[30m"
+
+def ensure_base_dirs():
+    os.makedirs(CODEXC_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(HOMES_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(LOCAL_BIN_DIR, mode=0o755, exist_ok=True)
+
+def get_real_codex_bin() -> str:
+    if os.path.isfile(CENTRAL_CODEX_BIN) and os.access(CENTRAL_CODEX_BIN, os.X_OK):
+        return CENTRAL_CODEX_BIN
+    cand = shutil.which("codex")
+    if cand and os.path.realpath(cand) != os.path.realpath(os.path.join(LOCAL_BIN_DIR, "codex")):
+        return cand
+    return "/home/aidev/.codex/packages/standalone/releases/0.164.0-x86_64-unknown-linux-musl/bin/codex"
+
+def list_aliases() -> list[str]:
+    ensure_base_dirs()
+    if not os.path.exists(HOMES_DIR):
+        return []
+    items = []
+    for entry in os.listdir(HOMES_DIR):
+        full = os.path.join(HOMES_DIR, entry)
+        if os.path.isdir(full) and entry.startswith("codex"):
+            items.append(entry)
+    items.sort()
+    return items
+
+def get_active_alias() -> str:
+    if os.path.isfile(ACTIVE_FILE):
+        try:
+            with open(ACTIVE_FILE, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+    return get_default_alias()
+
+def get_default_alias() -> str:
+    if os.path.isfile(DEFAULT_FILE):
+        try:
+            with open(DEFAULT_FILE, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+    aliases = list_aliases()
+    return aliases[0] if aliases else "codex01"
+
+def set_active_alias(alias: str):
+    ensure_base_dirs()
+    with open(ACTIVE_FILE, "w", encoding="utf-8") as f:
+        f.write(alias + "\n")
+
+def set_default_alias(alias: str):
+    ensure_base_dirs()
+    with open(DEFAULT_FILE, "w", encoding="utf-8") as f:
+        f.write(alias + "\n")
+
+def get_profile_dir(alias: str) -> str:
+    return os.path.join(HOMES_DIR, alias)
+
+def get_profile_auth_file(alias: str) -> str:
+    return os.path.join(get_profile_dir(alias), "auth.json")
+
+def format_countdown_from_seconds(secs: int | float | None) -> str:
+    if secs is None:
+        return "N/A"
+    s = int(max(0, secs))
+    if s <= 0:
+        return "Disponible"
+    days = s // 86400
+    hours = (s % 86400) // 3600
+    mins = (s % 3600) // 60
+    if days > 0:
+        return f"{days}d {hours:02d}h"
+    if hours > 0:
+        return f"{hours}h {mins:02d}m"
+    return f"{mins}m"
+
+def make_linebar(fraction: float | None, length: int = 10) -> str:
+    if fraction is None:
+        return f"{C_DIM}[{'-' * length}]  N/A{C_RESET}"
+    pct = max(0.0, min(1.0, float(fraction)))
+    filled = int(round(pct * length))
+    empty = length - filled
+    pct_int = int(round(pct * 100))
+    if pct >= 0.5:
+        color = C_GREEN
+    elif pct >= 0.2:
+        color = C_YELLOW
+    else:
+        color = C_RED
+    bar = "█" * filled + "░" * empty
+    return f"{color}[{bar}] {pct_int:3d}%{C_RESET}"
+
+ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+def visible_len(s: str) -> int:
+    return len(ANSI_REGEX.sub('', s))
+
+def pad_visible(s: str, width: int) -> str:
+    vis_len = visible_len(s)
+    padding = max(0, width - vis_len)
+    return s + (" " * padding)
+
+def fetch_codex_usage(alias: str, force_refresh: bool = False) -> dict:
+    """Consulta la API en vivo de OpenAI ChatGPT para obtener métricas de consumo."""
+    cache_file = f"/tmp/codexc_quota_cache_{alias}.json"
+    now_ts = time.time()
+
+    if not force_refresh and os.path.isfile(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+                if now_ts - cached.get("cached_at", 0) < CACHE_TTL_SECONDS:
+                    return cached
+        except Exception:
+            pass
+
+    auth_file = get_profile_auth_file(alias)
+    if not os.path.isfile(auth_file):
+        return {
+            "error": "auth_missing",
+            "message": "Archivo auth.json no encontrado",
+            "cached_at": now_ts
+        }
+
+    try:
+        with open(auth_file, "r", encoding="utf-8") as f:
+            auth_data = json.load(f)
+    except Exception as e:
+        return {"error": "auth_invalid", "message": str(e), "cached_at": now_ts}
+
+    tokens = auth_data.get("tokens", {})
+    access_token = tokens.get("access_token")
+    account_id = tokens.get("account_id")
+
+    if not access_token:
+        return {"error": "token_missing", "message": "Access token ausente en auth.json", "cached_at": now_ts}
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "codex-cli/0.164.0",
+        "Accept": "application/json"
+    }
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+
+    url = "https://chatgpt.com/backend-api/codex/usage"
+    req = urllib.request.Request(url, headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"error": "token_expired", "message": "Token expirado o inválido (HTTP 401)", "cached_at": now_ts}
+        return {"error": "http_error", "message": f"HTTP {e.code}: {e.reason}", "cached_at": now_ts}
+    except Exception as e:
+        return {"error": "network_error", "message": str(e), "cached_at": now_ts}
+
+    # Procesar métricas
+    rate_limit = data.get("rate_limit", {})
+    prim = rate_limit.get("primary_window", {}) or {}
+    sec = rate_limit.get("secondary_window", {}) or {}
+
+    p_used = prim.get("used_percent", 0)
+    p_rem_frac = max(0.0, min(1.0, (100.0 - float(p_used)) / 100.0))
+    p_reset_sec = prim.get("reset_after_seconds")
+
+    s_used = sec.get("used_percent", 0)
+    s_rem_frac = max(0.0, min(1.0, (100.0 - float(s_used)) / 100.0))
+    s_reset_sec = sec.get("reset_after_seconds")
+
+    metrics = {
+        "alias": alias,
+        "email": data.get("email"),
+        "user_id": data.get("user_id"),
+        "account_id": data.get("account_id"),
+        "plan_type": data.get("plan_type", "plus"),
+        "primary_window": {
+            "used_percent": p_used,
+            "remaining_fraction": p_rem_frac,
+            "reset_after_seconds": p_reset_sec,
+            "reset_str": format_countdown_from_seconds(p_reset_sec),
+        },
+        "secondary_window": {
+            "used_percent": s_used,
+            "remaining_fraction": s_rem_frac,
+            "reset_after_seconds": s_reset_sec,
+            "reset_str": format_countdown_from_seconds(s_reset_sec),
+        },
+        "allowed": rate_limit.get("allowed", True),
+        "limit_reached": rate_limit.get("limit_reached", False),
+        "cached_at": now_ts
+    }
+
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(metrics, f)
+    except Exception:
+        pass
+
+    return metrics
+
+def ensure_auto_migration():
+    """Migra de forma no destructiva la cuenta existente en ~/.codex hacia codex01 si no hay perfiles."""
+    aliases = list_aliases()
+    if aliases:
+        return
+    auth_src = os.path.join(SYSTEM_CODEX_DIR, "auth.json")
+    if not os.path.isfile(auth_src):
+        return
+
+    prof_dir = get_profile_dir("codex01")
+    os.makedirs(prof_dir, mode=0o700, exist_ok=True)
+
+    auth_dst = os.path.join(prof_dir, "auth.json")
+    if not os.path.exists(auth_dst):
+        shutil.copy2(auth_src, auth_dst)
+        os.chmod(auth_dst, 0o600)
+
+    cfg_src = os.path.join(SYSTEM_CODEX_DIR, "config.toml")
+    cfg_dst = os.path.join(prof_dir, "config.toml")
+    if os.path.isfile(cfg_src) and not os.path.exists(cfg_dst):
+        shutil.copy2(cfg_src, cfg_dst)
+        os.chmod(cfg_dst, 0o600)
+
+    skills_src = os.path.join(SYSTEM_CODEX_DIR, "skills")
+    skills_dst = os.path.join(prof_dir, "skills")
+    if os.path.isdir(skills_src) and not os.path.exists(skills_dst):
+        try:
+            os.symlink(skills_src, skills_dst)
+        except Exception:
+            pass
+
+    set_active_alias("codex01")
+    set_default_alias("codex01")
+    sync_launchers()
+
+def sync_launchers():
+    """Genera y sincroniza los binarios lanzadores en ~/.local/bin/ (codex01, codex02, codex wrapper)."""
+    ensure_base_dirs()
+    real_bin = get_real_codex_bin()
+    aliases = list_aliases()
+
+    # 1. Lanzador por cada cuenta (codex01, codex02...)
+    for alias in aliases:
+        launcher_path = os.path.join(LOCAL_BIN_DIR, alias)
+        content = f"""#!/usr/bin/env bash
+# Lanzador aislado para {alias} generado por codexc
+export CODEX_HOME="{get_profile_dir(alias)}"
+exec "{real_bin}" "$@"
+"""
+        with open(launcher_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(launcher_path, 0o755)
+
+    # 2. Wrapper para el comando estándar 'codex'
+    wrapper_path = os.path.join(LOCAL_BIN_DIR, "codex")
+    wrapper_content = f"""#!/usr/bin/env bash
+# Wrapper inteligente para 'codex' administrado por codexc
+REAL_BIN="{real_bin}"
+if [ -z "$CODEX_HOME" ]; then
+    ACTIVE_FILE="{ACTIVE_FILE}"
+    DEFAULT_FILE="{DEFAULT_FILE}"
+    if [ -f "$ACTIVE_FILE" ]; then
+        ACTIVE=$(cat "$ACTIVE_FILE" 2>/dev/null | tr -d '[:space:]')
+    elif [ -f "$DEFAULT_FILE" ]; then
+        ACTIVE=$(cat "$DEFAULT_FILE" 2>/dev/null | tr -d '[:space:]')
+    else
+        ACTIVE="codex01"
+    fi
+    TARGET_HOME="{HOMES_DIR}/$ACTIVE"
+    if [ -d "$TARGET_HOME" ]; then
+        export CODEX_HOME="$TARGET_HOME"
+    fi
+fi
+exec "$REAL_BIN" "$@"
+"""
+    # Guardar wrapper sólo si no es ya el wrapper idéntico
+    write_wrapper = True
+    if os.path.isfile(wrapper_path) and not os.path.islink(wrapper_path):
+        try:
+            with open(wrapper_path, "r", encoding="utf-8") as f:
+                if "administrado por codexc" in f.read():
+                    write_wrapper = False
+        except Exception:
+            pass
+
+    if write_wrapper:
+        # Si ~/.local/bin/codex era un symlink al binario real, reemplazarlo por el wrapper
+        if os.path.islink(wrapper_path):
+            os.remove(wrapper_path)
+        with open(wrapper_path, "w", encoding="utf-8") as f:
+            f.write(wrapper_content)
+        os.chmod(wrapper_path, 0o755)
+
+    # 3. Symlink global para 'codexc'
+    codexc_target = os.path.join(LOCAL_BIN_DIR, "codexc")
+    current_script = os.path.realpath(os.path.abspath(__file__))
+    target_abs = os.path.abspath(codexc_target)
+    if current_script != target_abs:
+        try:
+            if os.path.lexists(codexc_target):
+                os.remove(codexc_target)
+            os.symlink(current_script, codexc_target)
+        except Exception:
+            pass
+
+def cmd_list(args):
+    ensure_auto_migration()
+    sync_launchers()
+
+    aliases = list_aliases()
+    if not aliases:
+        print(f"\n{C_YELLOW}No hay perfiles de Codex configurados.{C_RESET}")
+        print(f"Usa '{C_CYAN}codexc add codex01{C_RESET}' para vincular tu primera cuenta.\n")
+        return
+
+    active = get_active_alias()
+    default = get_default_alias()
+
+    accounts_data = []
+    force_ref = getattr(args, "refresh", False)
+
+    for alias in aliases:
+        usage = fetch_codex_usage(alias, force_refresh=force_ref)
+        accounts_data.append({
+            "alias": alias,
+            "is_active": (alias == active),
+            "is_default": (alias == default),
+            "usage": usage
+        })
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "active_account": active,
+            "default_account": default,
+            "accounts": accounts_data
+        }, indent=2))
+        return
+
+    col_alias = 11
+    col_email = 30
+    col_plan = 10
+    col_state = 15
+    col_5h = 32
+    col_week = 32
+
+    border_top = f"┌{'─' * col_alias}┬{'─' * col_email}┬{'─' * col_plan}┬{'─' * col_state}┬{'─' * col_5h}┬{'─' * col_week}┐"
+    border_mid = f"├{'─' * col_alias}┼{'─' * col_email}┼{'─' * col_plan}┼{'─' * col_state}┼{'─' * col_5h}┼{'─' * col_week}┤"
+    border_bot = f"└{'─' * col_alias}┴{'─' * col_email}┴{'─' * col_plan}┴{'─' * col_state}┴{'─' * col_5h}┴{'─' * col_week}┘"
+
+    header_title = f"{C_BOLD}{C_WHITE}PANEL DE CUENTAS DE OPENAI CODEX (CODEXC SWITCHER){C_RESET}"
+    print(header_title)
+    print(f"{C_DIM}Desarrollo en paralelo: consumo de tokens en ventana de 5 Horas y Semanal.{C_RESET}\n")
+
+    print(border_top)
+    hdr = (
+        f"│ {pad_visible(C_BOLD + 'ALIAS' + C_RESET, col_alias - 2)} "
+        f"│ {pad_visible(C_BOLD + 'CUENTA / EMAIL' + C_RESET, col_email - 2)} "
+        f"│ {pad_visible(C_BOLD + 'PLAN' + C_RESET, col_plan - 2)} "
+        f"│ {pad_visible(C_BOLD + 'ESTADO' + C_RESET, col_state - 2)} "
+        f"│ {pad_visible(C_BOLD + '5 HORAS (DISPONIBLE / RESET)' + C_RESET, col_5h - 2)} "
+        f"│ {pad_visible(C_BOLD + 'SEMANAL (DISPONIBLE / RESET)' + C_RESET, col_week - 2)} │"
+    )
+    print(hdr)
+    print(border_mid)
+
+    for i, item in enumerate(accounts_data):
+        alias = item["alias"]
+        is_act = item["is_active"]
+        is_def = item["is_default"]
+        usage = item["usage"]
+
+        if is_act and is_def:
+            state_str = f"{C_BG_GREEN}*ACTIVA+DEF{C_RESET}"
+            alias_disp = f"{C_BOLD}{C_GREEN}* {alias}{C_RESET}"
+        elif is_act:
+            state_str = f"{C_GREEN}* ACTIVA{C_RESET}"
+            alias_disp = f"{C_BOLD}{C_GREEN}* {alias}{C_RESET}"
+        elif is_def:
+            state_str = f"{C_CYAN}  DEFAULT{C_RESET}"
+            alias_disp = f"  {alias}"
+        else:
+            state_str = f"{C_DIM}  LISTA{C_RESET}"
+            alias_disp = f"  {alias}"
+
+        if "error" in usage:
+            email_disp = f"{C_RED}Error de auth{C_RESET}"
+            plan_disp = "-"
+            p5_disp = f"{C_RED}{usage.get('message', 'Error')}{C_RESET}"
+            pw_disp = f"{C_DIM}Re-vincular cuenta{C_RESET}"
+        else:
+            email = usage.get("email") or "(email no disponible)"
+            if len(email) > col_email - 2:
+                email_disp = email[:col_email - 5] + "..."
+            else:
+                email_disp = email
+
+            plan_disp = usage.get("plan_type", "plus").upper()
+            if plan_disp == "PRO":
+                plan_disp = f"{C_MAGENTA}{plan_disp}{C_RESET}"
+            elif plan_disp == "TEAM":
+                plan_disp = f"{C_CYAN}{plan_disp}{C_RESET}"
+
+            prim = usage.get("primary_window", {})
+            sec = usage.get("secondary_window", {})
+
+            p5_frac = prim.get("remaining_fraction", 1.0)
+            p5_rst = prim.get("reset_str", "")
+
+            pw_frac = sec.get("remaining_fraction", 1.0)
+            pw_rst = sec.get("reset_str", "")
+
+            p5_disp = f"5H:  {make_linebar(p5_frac, length=8)} ({p5_rst})"
+            pw_disp = f"Sem: {make_linebar(pw_frac, length=8)} ({pw_rst})"
+
+        row = (
+            f"│ {pad_visible(alias_disp, col_alias - 2)} "
+            f"│ {pad_visible(email_disp, col_email - 2)} "
+            f"│ {pad_visible(plan_disp, col_plan - 2)} "
+            f"│ {pad_visible(state_str, col_state - 2)} "
+            f"│ {pad_visible(p5_disp, col_5h - 2)} "
+            f"│ {pad_visible(pw_disp, col_week - 2)} │"
+        )
+        print(row)
+        if i < len(accounts_data) - 1:
+            print(border_mid)
+
+    print(border_bot)
+
+    print("\nAtajos rápidos para desarrollo en paralelo:")
+    print(f"  • Ejecución directa fija:  {C_CYAN}codex01{C_RESET} | {C_CYAN}codex02{C_RESET} (aisladas sin tocarse)")
+    print(f"  • Cambiar cuenta activa:   {C_CYAN}codexc switch <alias>{C_RESET} (o 'codexc <alias>')")
+    print(f"  • Agregar nueva cuenta:    {C_CYAN}codexc add [alias]{C_RESET} (asigna correlativo en automático)")
+    print(f"  • Rotación automática:     {C_CYAN}codexc auto{C_RESET} (selecciona la cuenta con mayor saldo)")
+    print(f"  • Diagnóstico de perfiles: {C_CYAN}codexc doctor{C_RESET}\n")
+
+def cmd_switch(args):
+    ensure_auto_migration()
+    alias = args.alias
+    aliases = list_aliases()
+    if alias not in aliases:
+        print(f"{C_RED}Error:{C_RESET} El alias '{alias}' no existe.")
+        print(f"Cuentas disponibles: {', '.join(aliases)}")
+        sys.exit(1)
+
+    set_active_alias(alias)
+    sync_launchers()
+    usage = fetch_codex_usage(alias)
+    email = usage.get("email") or "cuenta"
+    print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta activa cambiada a: {alias} ({email}){C_RESET}")
+    print(f"{C_DIM}A partir de ahora, el comando 'codex' utilizará el perfil {alias}.{C_RESET}")
+    print(f"{C_DIM}Para usar cuentas específicas en paralelo, usa siempre 'codex01' o 'codex02'.{C_RESET}\n")
+
+def cmd_default(args):
+    ensure_auto_migration()
+    alias = args.alias
+    aliases = list_aliases()
+    if alias not in aliases:
+        print(f"{C_RED}Error:{C_RESET} El alias '{alias}' no existe.")
+        print(f"Cuentas disponibles: {', '.join(aliases)}")
+        sys.exit(1)
+
+    set_default_alias(alias)
+    print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta predeterminada configurada como: {alias}{C_RESET}\n")
+
+def cmd_add(args):
+    ensure_auto_migration()
+    aliases = list_aliases()
+
+    alias = args.alias
+    if not alias:
+        idx = 1
+        while f"codex{idx:02d}" in aliases:
+            idx += 1
+        alias = f"codex{idx:02d}"
+
+    prof_dir = get_profile_dir(alias)
+    os.makedirs(prof_dir, mode=0o700, exist_ok=True)
+
+    # Copiar configuración base si no existe
+    cfg_dst = os.path.join(prof_dir, "config.toml")
+    if not os.path.exists(cfg_dst):
+        cfg_src = os.path.join(SYSTEM_CODEX_DIR, "config.toml")
+        if os.path.isfile(cfg_src):
+            shutil.copy2(cfg_src, cfg_dst)
+            os.chmod(cfg_dst, 0o600)
+
+    # Enlazar skills si existen
+    skills_dst = os.path.join(prof_dir, "skills")
+    if not os.path.exists(skills_dst):
+        skills_src = os.path.join(SYSTEM_CODEX_DIR, "skills")
+        if os.path.isdir(skills_src):
+            try:
+                os.symlink(skills_src, skills_dst)
+            except Exception:
+                pass
+
+    real_bin = get_real_codex_bin()
+    print(f"\n{C_BOLD}{C_CYAN}▶ Iniciando vinculación de cuenta para '{alias}'...{C_RESET}")
+    print(f"{C_DIM}CODEX_HOME={prof_dir}{C_RESET}")
+
+    env = os.environ.copy()
+    env["CODEX_HOME"] = prof_dir
+
+    login_cmd = [real_bin, "login"]
+    if getattr(args, "device_auth", False):
+        login_cmd.append("--device-auth")
+
+    try:
+        subprocess.run(login_cmd, env=env, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"\n{C_RED}Error al ejecutar 'codex login': código {e.returncode}{C_RESET}\n")
+        sys.exit(e.returncode)
+
+    auth_file = os.path.join(prof_dir, "auth.json")
+    if not os.path.isfile(auth_file):
+        print(f"\n{C_RED}Error:{C_RESET} No se generó el archivo auth.json en {prof_dir}.\n")
+        sys.exit(1)
+
+    os.chmod(auth_file, 0o600)
+
+    # Validar y verificar si es duplicada
+    usage = fetch_codex_usage(alias, force_refresh=True)
+    email = usage.get("email")
+
+    if email:
+        for other in aliases:
+            if other != alias:
+                other_usage = fetch_codex_usage(other)
+                if other_usage.get("email") == email:
+                    print(f"\n{C_BOLD}{C_YELLOW}⚠ Advertencia: Este correo ({email}) ya está vinculado en '{other}'.{C_RESET}")
+                    print(f"Ambos perfiles compartirán el mismo saldo de cuotas de OpenAI.\n")
+                    break
+
+    sync_launchers()
+    set_active_alias(alias)
+
+    print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta '{alias}' configurada exitosamente.{C_RESET}")
+    if email:
+        print(f"  Usuario: {email} (Plan: {usage.get('plan_type', 'plus')})")
+    print(f"  Lanzador disponible: {C_CYAN}{alias}{C_RESET}")
+    print(f"  Cuenta activa ahora: {C_GREEN}{alias}{C_RESET}\n")
+
+def cmd_auto(args):
+    ensure_auto_migration()
+    aliases = list_aliases()
+    if not aliases:
+        print(f"{C_RED}No hay cuentas disponibles.{C_RESET}")
+        return
+
+    print(f"\n{C_BOLD}Evaluando cuotas de {len(aliases)} cuentas de Codex...{C_RESET}")
+    best_alias = None
+    best_5h_frac = -1.0
+    best_week_frac = -1.0
+
+    for alias in aliases:
+        usage = fetch_codex_usage(alias, force_refresh=True)
+        if "error" in usage:
+            print(f"  • {alias:<8}: {C_RED}[Error de autenticación]{C_RESET}")
+            continue
+
+        p5 = usage.get("primary_window", {})
+        pw = usage.get("secondary_window", {})
+
+        p5_frac = p5.get("remaining_fraction", 0.0)
+        pw_frac = pw.get("remaining_fraction", 0.0)
+        p5_pct = int(round(p5_frac * 100))
+        pw_pct = int(round(pw_frac * 100))
+
+        status_tag = ""
+        if pw_frac <= 0.001:
+            status_tag = f" {C_RED}[Semanal Agotada]{C_RESET}"
+        elif p5_frac <= 0.001:
+            status_tag = f" {C_YELLOW}[5H Agotada]{C_RESET}"
+
+        print(f"  • {alias:<8} ({usage.get('email')}): 5H = {p5_pct:3d}% | Semanal = {pw_pct:3d}%{status_tag}")
+
+        if pw_frac > 0.001 and p5_frac > 0.001:
+            if p5_frac > best_5h_frac:
+                best_5h_frac = p5_frac
+                best_week_frac = pw_frac
+                best_alias = alias
+
+    if best_alias:
+        set_active_alias(best_alias)
+        print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta óptima seleccionada: {best_alias} (5H disponible: {int(best_5h_frac*100)}%){C_RESET}\n")
+    else:
+        print(f"\n{C_BOLD}{C_YELLOW}⚠ Todas las cuentas están en límite de cuota o inaccesibles.{C_RESET}\n")
+
+def cmd_quota(args):
+    ensure_auto_migration()
+    alias = args.alias or get_active_alias()
+    aliases = list_aliases()
+    if alias not in aliases:
+        print(f"{C_RED}Error:{C_RESET} El alias '{alias}' no existe.")
+        sys.exit(1)
+
+    usage = fetch_codex_usage(alias, force_refresh=True)
+    if "error" in usage:
+        print(f"\n{C_RED}Error:{C_RESET} {usage.get('message')}\n")
+        return
+
+    print(f"\n{C_BOLD}{C_CYAN}DETALLE DE CUOTA CODEX: {alias} ({usage.get('email')}){C_RESET}")
+    print(f"  Plan: {usage.get('plan_type', 'plus').upper()} | Account ID: {usage.get('account_id')}")
+
+    prim = usage.get("primary_window", {})
+    sec = usage.get("secondary_window", {})
+
+    print(f"\n  • Ventana 5 Horas:")
+    print(f"    Restante:   {make_linebar(prim.get('remaining_fraction'), length=16)}")
+    print(f"    Consumido:  {prim.get('used_percent', 0)}%")
+    print(f"    Reinicio:   en {prim.get('reset_str', 'N/A')}")
+
+    print(f"\n  • Ventana Semanal:")
+    print(f"    Restante:   {make_linebar(sec.get('remaining_fraction'), length=16)}")
+    print(f"    Consumido:  {sec.get('used_percent', 0)}%")
+    print(f"    Reinicio:   en {sec.get('reset_str', 'N/A')}")
+    print("")
+
+def cmd_doctor(args):
+    ensure_auto_migration()
+    sync_launchers()
+    print(f"\n{C_BOLD}{C_WHITE}DIAGNÓSTICO DE CODEXC SWITCHER{C_RESET}\n")
+    real_bin = get_real_codex_bin()
+    print(f"  Binario real de Codex:  {real_bin} ({'✓ Encontrado' if os.path.isfile(real_bin) else '✗ NO ENCONTRADO'})")
+    print(f"  Directorio de perfiles: {HOMES_DIR}")
+    print(f"  Cuenta activa:          {get_active_alias()}")
+    print(f"  Cuenta default:         {get_default_alias()}")
+
+    aliases = list_aliases()
+    print(f"\n  Perfiles registrados ({len(aliases)}):")
+    for alias in aliases:
+        prof = get_profile_dir(alias)
+        auth = get_profile_auth_file(alias)
+        launcher = os.path.join(LOCAL_BIN_DIR, alias)
+
+        prof_ok = os.path.isdir(prof)
+        auth_ok = os.path.isfile(auth)
+        launch_ok = os.path.isfile(launcher) and os.access(launcher, os.X_OK)
+
+        status_parts = []
+        status_parts.append(f"dir: {'✓' if prof_ok else '✗'}")
+        status_parts.append(f"auth: {'✓' if auth_ok else '✗'}")
+        status_parts.append(f"launcher: {'✓' if launch_ok else '✗'}")
+
+        print(f"    • {alias:<8} [{', '.join(status_parts)}]")
+
+    print(f"\n{C_GREEN}✓ Diagnóstico completado.{C_RESET}\n")
+
+def cmd_rm(args):
+    ensure_auto_migration()
+    alias = args.alias
+    aliases = list_aliases()
+    if alias not in aliases:
+        print(f"{C_RED}Error:{C_RESET} El alias '{alias}' no existe.")
+        sys.exit(1)
+
+    prof = get_profile_dir(alias)
+    launcher = os.path.join(LOCAL_BIN_DIR, alias)
+
+    confirm = input(f"¿Estás seguro de eliminar el perfil '{alias}' ({prof})? [s/N]: ")
+    if confirm.lower() not in ("s", "si", "y", "yes"):
+        print("Operación cancelada.")
+        return
+
+    try:
+        shutil.rmtree(prof)
+    except Exception as e:
+        print(f"{C_RED}Error al borrar carpeta: {e}{C_RESET}")
+
+    if os.path.lexists(launcher):
+        try:
+            os.remove(launcher)
+        except Exception:
+            pass
+
+    if get_active_alias() == alias:
+        remaining = [a for a in aliases if a != alias]
+        if remaining:
+            set_active_alias(remaining[0])
+            print(f"Cuenta activa reasignada a: {remaining[0]}")
+
+    sync_launchers()
+    print(f"{C_GREEN}✓ Perfil '{alias}' eliminado.{C_RESET}\n")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="codexc - Administrador multi-cuenta y aislador de perfiles para OpenAI Codex CLI.",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="Comandos disponibles")
+
+    # list
+    p_list = subparsers.add_parser("list", help="Listar cuentas, cuotas y estados")
+    p_list.add_argument("--json", action="store_true", help="Salida en formato JSON")
+    p_list.add_argument("--refresh", "-r", action="store_true", help="Forzar consulta en vivo a OpenAI")
+    p_list.set_defaults(func=cmd_list)
+
+    # switch
+    p_switch = subparsers.add_parser("switch", help="Cambiar cuenta activa")
+    p_switch.add_argument("alias", help="Alias de la cuenta (ej. codex01, codex02)")
+    p_switch.set_defaults(func=cmd_switch)
+
+    # default
+    p_default = subparsers.add_parser("default", help="Establecer cuenta predeterminada")
+    p_default.add_argument("alias", help="Alias de la cuenta")
+    p_default.set_defaults(func=cmd_default)
+
+    # add
+    p_add = subparsers.add_parser("add", help="Vincular una nueva cuenta de Codex")
+    p_add.add_argument("alias", nargs="?", help="Alias opcional (ej. codex02)")
+    p_add.add_argument("--device-auth", action="store_true", help="Usar flujo de login por código de dispositivo")
+    p_add.set_defaults(func=cmd_add)
+
+    # quota
+    p_quota = subparsers.add_parser("quota", help="Ver detalle de cuota de una cuenta")
+    p_quota.add_argument("alias", nargs="?", help="Alias de la cuenta")
+    p_quota.set_defaults(func=cmd_quota)
+
+    # auto
+    p_auto = subparsers.add_parser("auto", help="Rotar a la cuenta con mayor saldo disponible")
+    p_auto.set_defaults(func=cmd_auto)
+
+    # doctor
+    p_doctor = subparsers.add_parser("doctor", help="Diagnosticar estado de perfiles y binarios")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    # rm
+    p_rm = subparsers.add_parser("rm", help="Eliminar un perfil de cuenta")
+    p_rm.add_argument("alias", help="Alias a eliminar")
+    p_rm.set_defaults(func=cmd_rm)
+
+    # Atajo directo: si el primer argumento es un alias existente, actuar como 'switch'
+    if len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
+        candidate = sys.argv[1]
+        aliases = list_aliases()
+        if candidate in aliases:
+            set_active_alias(candidate)
+            usage = fetch_codex_usage(candidate)
+            print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta activa cambiada a: {candidate} ({usage.get('email', '')}){C_RESET}\n")
+            sys.exit(0)
+
+    if len(sys.argv) == 1:
+        cmd_list(argparse.Namespace(refresh=False, json=False))
+        sys.exit(0)
+
+    args = parser.parse_args()
+    if hasattr(args, "func"):
+        args.func(args)
+    else:
+        cmd_list(argparse.Namespace(refresh=False, json=False))
+
+if __name__ == "__main__":
+    main()
