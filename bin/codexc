@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 # Rutas estándar del sistema
 REAL_HOME = os.environ.get("CODEX_REAL_HOME") or "/home/aidev"
 CODEXC_DIR = os.path.join(REAL_HOME, ".codexc")
+CACHE_DIR = os.path.join(CODEXC_DIR, "cache")
 HOMES_DIR = os.path.join(REAL_HOME, ".codexc_homes")
 ACTIVE_FILE = os.path.join(CODEXC_DIR, "active")
 DEFAULT_FILE = os.path.join(CODEXC_DIR, "default")
@@ -27,6 +28,12 @@ CENTRAL_CODEX_BIN = os.path.join(SYSTEM_CODEX_DIR, "packages", "standalone", "cu
 LOCAL_BIN_DIR = os.path.join(REAL_HOME, ".local", "bin")
 
 CACHE_TTL_SECONDS = 60
+RESERVED_NAMES = {
+    "codex", "codexc", "active", "default", "current",
+    "bin", "skills", "packages", "cache", "null", "all"
+}
+ALIAS_REGEX = re.compile(r'^[a-zA-Z0-9_-]{1,32}$')
+ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
 # Códigos ANSI para formato visual en terminal
 C_RESET = "\033[0m"
@@ -42,8 +49,20 @@ C_WHITE = "\033[37m"
 C_BG_GREEN = "\033[42m\033[30m"
 C_BG_BLUE = "\033[44m\033[30m"
 
+def validate_alias(alias: str) -> str:
+    """Valida estrictamente el nombre del alias para evitar path traversal o inyecciones."""
+    if not alias or not isinstance(alias, str):
+        raise ValueError("El alias no puede estar vacío.")
+    cleaned = alias.strip()
+    if not ALIAS_REGEX.match(cleaned):
+        raise ValueError(f"Alias inválido '{alias}'. Solo caracteres alfanuméricos, guiones y guiones bajos (máx 32).")
+    if cleaned.lower() in RESERVED_NAMES:
+        raise ValueError(f"El alias '{alias}' es un nombre reservado del sistema.")
+    return cleaned
+
 def ensure_base_dirs():
     os.makedirs(CODEXC_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
     os.makedirs(HOMES_DIR, mode=0o700, exist_ok=True)
     os.makedirs(LOCAL_BIN_DIR, mode=0o755, exist_ok=True)
 
@@ -62,8 +81,9 @@ def list_aliases() -> list[str]:
     items = []
     for entry in os.listdir(HOMES_DIR):
         full = os.path.join(HOMES_DIR, entry)
-        if os.path.isdir(full) and entry.startswith("codex"):
-            items.append(entry)
+        if os.path.isdir(full) and entry.startswith("codex") and entry.lower() not in RESERVED_NAMES:
+            if os.path.isfile(os.path.join(full, "auth.json")):
+                items.append(entry)
     items.sort()
     return items
 
@@ -72,7 +92,7 @@ def get_active_alias() -> str:
         try:
             with open(ACTIVE_FILE, "r", encoding="utf-8") as f:
                 val = f.read().strip()
-                if val:
+                if val and val in list_aliases():
                     return val
         except Exception:
             pass
@@ -83,7 +103,7 @@ def get_default_alias() -> str:
         try:
             with open(DEFAULT_FILE, "r", encoding="utf-8") as f:
                 val = f.read().strip()
-                if val:
+                if val and val in list_aliases():
                     return val
         except Exception:
             pass
@@ -92,16 +112,19 @@ def get_default_alias() -> str:
 
 def set_active_alias(alias: str):
     ensure_base_dirs()
+    val = validate_alias(alias)
     with open(ACTIVE_FILE, "w", encoding="utf-8") as f:
-        f.write(alias + "\n")
+        f.write(val + "\n")
 
 def set_default_alias(alias: str):
     ensure_base_dirs()
+    val = validate_alias(alias)
     with open(DEFAULT_FILE, "w", encoding="utf-8") as f:
-        f.write(alias + "\n")
+        f.write(val + "\n")
 
 def get_profile_dir(alias: str) -> str:
-    return os.path.join(HOMES_DIR, alias)
+    val = validate_alias(alias)
+    return os.path.join(HOMES_DIR, val)
 
 def get_profile_auth_file(alias: str) -> str:
     return os.path.join(get_profile_dir(alias), "auth.json")
@@ -137,8 +160,6 @@ def make_linebar(fraction: float | None, length: int = 10) -> str:
     bar = "█" * filled + "░" * empty
     return f"{color}[{bar}] {pct_int:3d}%{C_RESET}"
 
-ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
-
 def visible_len(s: str) -> int:
     return len(ANSI_REGEX.sub('', s))
 
@@ -147,9 +168,25 @@ def pad_visible(s: str, width: int) -> str:
     padding = max(0, width - vis_len)
     return s + (" " * padding)
 
-def fetch_codex_usage(alias: str, force_refresh: bool = False) -> dict:
-    """Consulta la API en vivo de OpenAI ChatGPT para obtener métricas de consumo."""
-    cache_file = f"/tmp/codexc_quota_cache_{alias}.json"
+def attempt_native_token_refresh(alias: str) -> bool:
+    """Invoca la recuperación interna de Codex CLI para renovar un access token vencido."""
+    prof_dir = get_profile_dir(alias)
+    real_bin = get_real_codex_bin()
+    if not os.path.isdir(prof_dir) or not os.path.isfile(real_bin):
+        return False
+    env = os.environ.copy()
+    env["CODEX_HOME"] = prof_dir
+    try:
+        res = subprocess.run([real_bin, "login", "status"], env=env, capture_output=True, text=True, timeout=12)
+        return (res.returncode == 0)
+    except Exception:
+        return False
+
+def fetch_codex_usage(alias: str, force_refresh: bool = False, retry_on_401: bool = True) -> dict:
+    """Consulta la API en vivo de OpenAI ChatGPT con caché privada y manejo robusto de cuotas ausentes."""
+    ensure_base_dirs()
+    val_alias = validate_alias(alias)
+    cache_file = os.path.join(CACHE_DIR, f"{val_alias}.json")
     now_ts = time.time()
 
     if not force_refresh and os.path.isfile(cache_file):
@@ -157,13 +194,27 @@ def fetch_codex_usage(alias: str, force_refresh: bool = False) -> dict:
             with open(cache_file, "r", encoding="utf-8") as f:
                 cached = json.load(f)
                 if now_ts - cached.get("cached_at", 0) < CACHE_TTL_SECONDS:
+                    # Recalcular countdowns dinámicamente desde reset_at
+                    prim = cached.get("primary_window")
+                    if isinstance(prim, dict) and prim.get("reset_at"):
+                        diff = max(0, prim["reset_at"] - now_ts)
+                        prim["reset_after_seconds"] = diff
+                        prim["reset_str"] = format_countdown_from_seconds(diff)
+
+                    sec = cached.get("secondary_window")
+                    if isinstance(sec, dict) and sec.get("reset_at"):
+                        diff = max(0, sec["reset_at"] - now_ts)
+                        sec["reset_after_seconds"] = diff
+                        sec["reset_str"] = format_countdown_from_seconds(diff)
+
                     return cached
         except Exception:
             pass
 
-    auth_file = get_profile_auth_file(alias)
+    auth_file = get_profile_auth_file(val_alias)
     if not os.path.isfile(auth_file):
         return {
+            "alias": val_alias,
             "error": "auth_missing",
             "message": "Archivo auth.json no encontrado",
             "cached_at": now_ts
@@ -173,14 +224,14 @@ def fetch_codex_usage(alias: str, force_refresh: bool = False) -> dict:
         with open(auth_file, "r", encoding="utf-8") as f:
             auth_data = json.load(f)
     except Exception as e:
-        return {"error": "auth_invalid", "message": str(e), "cached_at": now_ts}
+        return {"alias": val_alias, "error": "auth_invalid", "message": str(e), "cached_at": now_ts}
 
     tokens = auth_data.get("tokens", {})
     access_token = tokens.get("access_token")
     account_id = tokens.get("account_id")
 
     if not access_token:
-        return {"error": "token_missing", "message": "Access token ausente en auth.json", "cached_at": now_ts}
+        return {"alias": val_alias, "error": "token_missing", "message": "Access token ausente en auth.json", "cached_at": now_ts}
 
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -197,51 +248,87 @@ def fetch_codex_usage(alias: str, force_refresh: bool = False) -> dict:
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        if e.code == 401:
-            return {"error": "token_expired", "message": "Token expirado o inválido (HTTP 401)", "cached_at": now_ts}
-        return {"error": "http_error", "message": f"HTTP {e.code}: {e.reason}", "cached_at": now_ts}
+        if e.code == 401 and retry_on_401:
+            # Intento único de auto-renovación mediante el motor nativo de Codex
+            if attempt_native_token_refresh(val_alias):
+                return fetch_codex_usage(val_alias, force_refresh=True, retry_on_401=False)
+            return {"alias": val_alias, "error": "token_expired", "message": "Token expirado o revocado (HTTP 401)", "cached_at": now_ts}
+        return {"alias": val_alias, "error": "http_error", "message": f"HTTP {e.code}: {e.reason}", "cached_at": now_ts}
     except Exception as e:
-        return {"error": "network_error", "message": str(e), "cached_at": now_ts}
+        return {"alias": val_alias, "error": "network_error", "message": str(e), "cached_at": now_ts}
 
-    # Procesar métricas
-    rate_limit = data.get("rate_limit", {})
-    prim = rate_limit.get("primary_window", {}) or {}
-    sec = rate_limit.get("secondary_window", {}) or {}
+    # Normalización estricta de métricas (no asumir 100% si viene ausente o null)
+    rate_limit = data.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        rate_limit = {}
 
-    p_used = prim.get("used_percent", 0)
-    p_rem_frac = max(0.0, min(1.0, (100.0 - float(p_used)) / 100.0))
-    p_reset_sec = prim.get("reset_after_seconds")
+    allowed = rate_limit.get("allowed", True)
+    limit_reached = rate_limit.get("limit_reached", False)
 
-    s_used = sec.get("used_percent", 0)
-    s_rem_frac = max(0.0, min(1.0, (100.0 - float(s_used)) / 100.0))
-    s_reset_sec = sec.get("reset_after_seconds")
+    prim = rate_limit.get("primary_window")
+    if isinstance(prim, dict):
+        p_used = prim.get("used_percent")
+        p_rem_frac = max(0.0, min(1.0, (100.0 - float(p_used)) / 100.0)) if p_used is not None else None
+        p_reset_at = prim.get("reset_at")
+        p_reset_sec = max(0, p_reset_at - now_ts) if p_reset_at else prim.get("reset_after_seconds")
+        p_window_data = {
+            "used_percent": p_used,
+            "remaining_fraction": p_rem_frac,
+            "reset_at": p_reset_at,
+            "reset_after_seconds": p_reset_sec,
+            "reset_str": format_countdown_from_seconds(p_reset_sec) if p_reset_sec is not None else "N/A",
+        }
+    else:
+        p_window_data = {
+            "used_percent": None,
+            "remaining_fraction": None,
+            "reset_at": None,
+            "reset_after_seconds": None,
+            "reset_str": "N/A",
+        }
+
+    sec = rate_limit.get("secondary_window")
+    if isinstance(sec, dict):
+        s_used = sec.get("used_percent")
+        s_rem_frac = max(0.0, min(1.0, (100.0 - float(s_used)) / 100.0)) if s_used is not None else None
+        s_reset_at = sec.get("reset_at")
+        s_reset_sec = max(0, s_reset_at - now_ts) if s_reset_at else sec.get("reset_after_seconds")
+        s_window_data = {
+            "used_percent": s_used,
+            "remaining_fraction": s_rem_frac,
+            "reset_at": s_reset_at,
+            "reset_after_seconds": s_reset_sec,
+            "reset_str": format_countdown_from_seconds(s_reset_sec) if s_reset_sec is not None else "N/A",
+        }
+    else:
+        s_window_data = {
+            "used_percent": None,
+            "remaining_fraction": None,
+            "reset_at": None,
+            "reset_after_seconds": None,
+            "reset_str": "N/A",
+        }
 
     metrics = {
-        "alias": alias,
+        "alias": val_alias,
         "email": data.get("email"),
         "user_id": data.get("user_id"),
         "account_id": data.get("account_id"),
         "plan_type": data.get("plan_type", "plus"),
-        "primary_window": {
-            "used_percent": p_used,
-            "remaining_fraction": p_rem_frac,
-            "reset_after_seconds": p_reset_sec,
-            "reset_str": format_countdown_from_seconds(p_reset_sec),
-        },
-        "secondary_window": {
-            "used_percent": s_used,
-            "remaining_fraction": s_rem_frac,
-            "reset_after_seconds": s_reset_sec,
-            "reset_str": format_countdown_from_seconds(s_reset_sec),
-        },
-        "allowed": rate_limit.get("allowed", True),
-        "limit_reached": rate_limit.get("limit_reached", False),
+        "primary_window": p_window_data,
+        "secondary_window": s_window_data,
+        "allowed": allowed,
+        "limit_reached": limit_reached,
         "cached_at": now_ts
     }
 
+    # Escritura atómica y con permisos privados 0600 en CACHE_DIR
     try:
-        with open(cache_file, "w", encoding="utf-8") as f:
+        tmp_cache = cache_file + f".tmp.{os.getpid()}"
+        with open(tmp_cache, "w", encoding="utf-8") as f:
             json.dump(metrics, f)
+        os.chmod(tmp_cache, 0o600)
+        os.replace(tmp_cache, cache_file)
     except Exception:
         pass
 
@@ -283,7 +370,7 @@ def ensure_auto_migration():
     sync_launchers()
 
 def sync_launchers():
-    """Genera y sincroniza los binarios lanzadores en ~/.local/bin/ (codex01, codex02, codex wrapper)."""
+    """Sincroniza binarios lanzadores sin escrituras redundantes ni sobreescritura de symlinks ajenos."""
     ensure_base_dirs()
     real_bin = get_real_codex_bin()
     aliases = list_aliases()
@@ -296,9 +383,20 @@ def sync_launchers():
 export CODEX_HOME="{get_profile_dir(alias)}"
 exec "{real_bin}" "$@"
 """
-        with open(launcher_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.chmod(launcher_path, 0o755)
+        need_write = True
+        if os.path.isfile(launcher_path) and not os.path.islink(launcher_path):
+            try:
+                with open(launcher_path, "r", encoding="utf-8") as f:
+                    if f.read() == content:
+                        need_write = False
+            except Exception:
+                pass
+        if need_write:
+            if os.path.islink(launcher_path):
+                os.remove(launcher_path)
+            with open(launcher_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(launcher_path, 0o755)
 
     # 2. Wrapper para el comando estándar 'codex'
     wrapper_path = os.path.join(LOCAL_BIN_DIR, "codex")
@@ -322,18 +420,16 @@ if [ -z "$CODEX_HOME" ]; then
 fi
 exec "$REAL_BIN" "$@"
 """
-    # Guardar wrapper sólo si no es ya el wrapper idéntico
-    write_wrapper = True
+    need_wrapper = True
     if os.path.isfile(wrapper_path) and not os.path.islink(wrapper_path):
         try:
             with open(wrapper_path, "r", encoding="utf-8") as f:
-                if "administrado por codexc" in f.read():
-                    write_wrapper = False
+                if f.read() == wrapper_content:
+                    need_wrapper = False
         except Exception:
             pass
 
-    if write_wrapper:
-        # Si ~/.local/bin/codex era un symlink al binario real, reemplazarlo por el wrapper
+    if need_wrapper:
         if os.path.islink(wrapper_path):
             os.remove(wrapper_path)
         with open(wrapper_path, "w", encoding="utf-8") as f:
@@ -345,12 +441,20 @@ exec "$REAL_BIN" "$@"
     current_script = os.path.realpath(os.path.abspath(__file__))
     target_abs = os.path.abspath(codexc_target)
     if current_script != target_abs:
-        try:
-            if os.path.lexists(codexc_target):
-                os.remove(codexc_target)
-            os.symlink(current_script, codexc_target)
-        except Exception:
-            pass
+        need_link = True
+        if os.path.islink(codexc_target):
+            try:
+                if os.path.realpath(codexc_target) == current_script:
+                    need_link = False
+            except Exception:
+                pass
+        if need_link:
+            try:
+                if os.path.lexists(codexc_target):
+                    os.remove(codexc_target)
+                os.symlink(current_script, codexc_target)
+            except Exception:
+                pass
 
 def cmd_list(args):
     ensure_auto_migration()
@@ -358,6 +462,9 @@ def cmd_list(args):
 
     aliases = list_aliases()
     if not aliases:
+        if getattr(args, "json", False):
+            print(json.dumps({"active_account": None, "default_account": None, "accounts": []}, indent=2))
+            return
         print(f"\n{C_YELLOW}No hay perfiles de Codex configurados.{C_RESET}")
         print(f"Usa '{C_CYAN}codexc add codex01{C_RESET}' para vincular tu primera cuenta.\n")
         return
@@ -443,7 +550,7 @@ def cmd_list(args):
             else:
                 email_disp = email
 
-            plan_disp = usage.get("plan_type", "plus").upper()
+            plan_disp = (usage.get("plan_type") or "plus").upper()
             if plan_disp == "PRO":
                 plan_disp = f"{C_MAGENTA}{plan_disp}{C_RESET}"
             elif plan_disp == "TEAM":
@@ -452,11 +559,11 @@ def cmd_list(args):
             prim = usage.get("primary_window", {})
             sec = usage.get("secondary_window", {})
 
-            p5_frac = prim.get("remaining_fraction", 1.0)
-            p5_rst = prim.get("reset_str", "")
+            p5_frac = prim.get("remaining_fraction")
+            p5_rst = prim.get("reset_str", "N/A")
 
-            pw_frac = sec.get("remaining_fraction", 1.0)
-            pw_rst = sec.get("reset_str", "")
+            pw_frac = sec.get("remaining_fraction")
+            pw_rst = sec.get("reset_str", "N/A")
 
             p5_disp = f"5H:  {make_linebar(p5_frac, length=8)} ({p5_rst})"
             pw_disp = f"Sem: {make_linebar(pw_frac, length=8)} ({pw_rst})"
@@ -484,7 +591,7 @@ def cmd_list(args):
 
 def cmd_switch(args):
     ensure_auto_migration()
-    alias = args.alias
+    alias = validate_alias(args.alias)
     aliases = list_aliases()
     if alias not in aliases:
         print(f"{C_RED}Error:{C_RESET} El alias '{alias}' no existe.")
@@ -501,7 +608,7 @@ def cmd_switch(args):
 
 def cmd_default(args):
     ensure_auto_migration()
-    alias = args.alias
+    alias = validate_alias(args.alias)
     aliases = list_aliases()
     if alias not in aliases:
         print(f"{C_RED}Error:{C_RESET} El alias '{alias}' no existe.")
@@ -515,14 +622,28 @@ def cmd_add(args):
     ensure_auto_migration()
     aliases = list_aliases()
 
-    alias = args.alias
-    if not alias:
+    raw_alias = args.alias
+    if not raw_alias:
         idx = 1
         while f"codex{idx:02d}" in aliases:
             idx += 1
         alias = f"codex{idx:02d}"
+    else:
+        try:
+            alias = validate_alias(raw_alias)
+        except ValueError as e:
+            print(f"\n{C_RED}Error:{C_RESET} {e}\n")
+            sys.exit(1)
 
     prof_dir = get_profile_dir(alias)
+    auth_file = get_profile_auth_file(alias)
+
+    # Protección contra sobreescritura accidental de perfil existente
+    if alias in aliases or os.path.isfile(auth_file):
+        print(f"\n{C_RED}Error:{C_RESET} El perfil '{alias}' ya existe.")
+        print(f"Para re-autenticar usa 'codexc login {alias}', o elimina el perfil primero con 'codexc rm {alias}'.\n")
+        sys.exit(1)
+
     os.makedirs(prof_dir, mode=0o700, exist_ok=True)
 
     # Copiar configuración base si no existe
@@ -556,36 +677,45 @@ def cmd_add(args):
 
     try:
         subprocess.run(login_cmd, env=env, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"\n{C_RED}Error al ejecutar 'codex login': código {e.returncode}{C_RESET}\n")
-        sys.exit(e.returncode)
+    except (subprocess.CalledProcessError, KeyboardInterrupt):
+        # Si fue cancelado o falló, limpiar directorio para no dejar perfil zombie
+        if not os.path.isfile(auth_file):
+            shutil.rmtree(prof_dir, ignore_errors=True)
+        print(f"\n{C_RED}Inicio de sesión cancelado o fallido.{C_RESET}\n")
+        sys.exit(1)
 
-    auth_file = os.path.join(prof_dir, "auth.json")
     if not os.path.isfile(auth_file):
+        shutil.rmtree(prof_dir, ignore_errors=True)
         print(f"\n{C_RED}Error:{C_RESET} No se generó el archivo auth.json en {prof_dir}.\n")
         sys.exit(1)
 
     os.chmod(auth_file, 0o600)
 
-    # Validar y verificar si es duplicada
+    # Validar cuota e identidad de la nueva cuenta
     usage = fetch_codex_usage(alias, force_refresh=True)
     email = usage.get("email")
+    account_id = usage.get("account_id")
 
-    if email:
-        for other in aliases:
-            if other != alias:
-                other_usage = fetch_codex_usage(other)
-                if other_usage.get("email") == email:
-                    print(f"\n{C_BOLD}{C_YELLOW}⚠ Advertencia: Este correo ({email}) ya está vinculado en '{other}'.{C_RESET}")
-                    print(f"Ambos perfiles compartirán el mismo saldo de cuotas de OpenAI.\n")
-                    break
+    # Detección estricta de cuentas duplicadas: bloquear y revertir
+    for other in aliases:
+        if other != alias:
+            other_usage = fetch_codex_usage(other)
+            other_email = other_usage.get("email")
+            other_acc = other_usage.get("account_id")
+            if (account_id and other_acc and account_id == other_acc) or (email and other_email and email.lower() == other_email.lower()):
+                print(f"\n{C_BOLD}{C_RED}✗ Cuenta Duplicada Detectada:{C_RESET}")
+                print(f"  El correo '{email}' (ID: {account_id}) ya está registrado como '{other}'.")
+                print(f"  No se permite registrar perfiles duplicados que consuman la misma cuota de OpenAI.")
+                print(f"  Eliminando perfil duplicado...")
+                shutil.rmtree(prof_dir, ignore_errors=True)
+                sys.exit(1)
 
     sync_launchers()
     set_active_alias(alias)
 
     print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta '{alias}' configurada exitosamente.{C_RESET}")
     if email:
-        print(f"  Usuario: {email} (Plan: {usage.get('plan_type', 'plus')})")
+        print(f"  Usuario: {email} (Plan: {(usage.get('plan_type') or 'plus').upper()})")
     print(f"  Lanzador disponible: {C_CYAN}{alias}{C_RESET}")
     print(f"  Cuenta activa ahora: {C_GREEN}{alias}{C_RESET}\n")
 
@@ -610,34 +740,51 @@ def cmd_auto(args):
         p5 = usage.get("primary_window", {})
         pw = usage.get("secondary_window", {})
 
-        p5_frac = p5.get("remaining_fraction", 0.0)
-        pw_frac = pw.get("remaining_fraction", 0.0)
-        p5_pct = int(round(p5_frac * 100))
-        pw_pct = int(round(pw_frac * 100))
+        p5_frac = p5.get("remaining_fraction")
+        pw_frac = pw.get("remaining_fraction")
+        allowed = usage.get("allowed", True)
+        limit_reached = usage.get("limit_reached", False)
+
+        p5_pct = int(round(p5_frac * 100)) if p5_frac is not None else 0
+        pw_pct = int(round(pw_frac * 100)) if pw_frac is not None else 0
 
         status_tag = ""
-        if pw_frac <= 0.001:
+        is_blocked = False
+        if limit_reached or not allowed:
+            status_tag = f" {C_RED}[Límite Alcanzado / Bloqueada]{C_RESET}"
+            is_blocked = True
+        elif pw_frac is not None and pw_frac <= 0.001:
             status_tag = f" {C_RED}[Semanal Agotada]{C_RESET}"
-        elif p5_frac <= 0.001:
+            is_blocked = True
+        elif p5_frac is not None and p5_frac <= 0.001:
             status_tag = f" {C_YELLOW}[5H Agotada]{C_RESET}"
+            is_blocked = True
 
-        print(f"  • {alias:<8} ({usage.get('email')}): 5H = {p5_pct:3d}% | Semanal = {pw_pct:3d}%{status_tag}")
+        p5_str = f"{p5_pct:3d}%" if p5_frac is not None else "N/A"
+        pw_str = f"{pw_pct:3d}%" if pw_frac is not None else "N/A"
+        print(f"  • {alias:<8} ({usage.get('email', 'desconocido')}): 5H = {p5_str} | Semanal = {pw_str}{status_tag}")
 
-        if pw_frac > 0.001 and p5_frac > 0.001:
+        if not is_blocked and p5_frac is not None and p5_frac > 0.001:
             if p5_frac > best_5h_frac:
                 best_5h_frac = p5_frac
-                best_week_frac = pw_frac
+                best_week_frac = pw_frac if pw_frac is not None else 1.0
                 best_alias = alias
 
     if best_alias:
         set_active_alias(best_alias)
         print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta óptima seleccionada: {best_alias} (5H disponible: {int(best_5h_frac*100)}%){C_RESET}\n")
     else:
-        print(f"\n{C_BOLD}{C_YELLOW}⚠ Todas las cuentas están en límite de cuota o inaccesibles.{C_RESET}\n")
+        print(f"\n{C_BOLD}{C_YELLOW}⚠ Todas las cuentas están en límite de cuota o bloqueadas.{C_RESET}\n")
 
 def cmd_quota(args):
     ensure_auto_migration()
-    alias = args.alias or get_active_alias()
+    raw_alias = args.alias or get_active_alias()
+    try:
+        alias = validate_alias(raw_alias)
+    except ValueError as e:
+        print(f"{C_RED}Error:{C_RESET} {e}")
+        sys.exit(1)
+
     aliases = list_aliases()
     if alias not in aliases:
         print(f"{C_RED}Error:{C_RESET} El alias '{alias}' no existe.")
@@ -649,19 +796,21 @@ def cmd_quota(args):
         return
 
     print(f"\n{C_BOLD}{C_CYAN}DETALLE DE CUOTA CODEX: {alias} ({usage.get('email')}){C_RESET}")
-    print(f"  Plan: {usage.get('plan_type', 'plus').upper()} | Account ID: {usage.get('account_id')}")
+    print(f"  Plan: {(usage.get('plan_type') or 'plus').upper()} | Account ID: {usage.get('account_id')}")
 
     prim = usage.get("primary_window", {})
     sec = usage.get("secondary_window", {})
 
     print(f"\n  • Ventana 5 Horas:")
     print(f"    Restante:   {make_linebar(prim.get('remaining_fraction'), length=16)}")
-    print(f"    Consumido:  {prim.get('used_percent', 0)}%")
+    used_5h = prim.get('used_percent')
+    print(f"    Consumido:  {f'{used_5h}%' if used_5h is not None else 'N/A'}")
     print(f"    Reinicio:   en {prim.get('reset_str', 'N/A')}")
 
     print(f"\n  • Ventana Semanal:")
     print(f"    Restante:   {make_linebar(sec.get('remaining_fraction'), length=16)}")
-    print(f"    Consumido:  {sec.get('used_percent', 0)}%")
+    used_w = sec.get('used_percent')
+    print(f"    Consumido:  {f'{used_w}%' if used_w is not None else 'N/A'}")
     print(f"    Reinicio:   en {sec.get('reset_str', 'N/A')}")
     print("")
 
@@ -672,6 +821,7 @@ def cmd_doctor(args):
     real_bin = get_real_codex_bin()
     print(f"  Binario real de Codex:  {real_bin} ({'✓ Encontrado' if os.path.isfile(real_bin) else '✗ NO ENCONTRADO'})")
     print(f"  Directorio de perfiles: {HOMES_DIR}")
+    print(f"  Directorio de caché:    {CACHE_DIR} ({'0700' if oct(os.stat(CACHE_DIR).st_mode & 0o777) == '0o700' else 'aviso'})")
     print(f"  Cuenta activa:          {get_active_alias()}")
     print(f"  Cuenta default:         {get_default_alias()}")
 
@@ -697,7 +847,12 @@ def cmd_doctor(args):
 
 def cmd_rm(args):
     ensure_auto_migration()
-    alias = args.alias
+    try:
+        alias = validate_alias(args.alias)
+    except ValueError as e:
+        print(f"{C_RED}Error:{C_RESET} {e}")
+        sys.exit(1)
+
     aliases = list_aliases()
     if alias not in aliases:
         print(f"{C_RED}Error:{C_RESET} El alias '{alias}' no existe.")
@@ -705,6 +860,7 @@ def cmd_rm(args):
 
     prof = get_profile_dir(alias)
     launcher = os.path.join(LOCAL_BIN_DIR, alias)
+    cache_file = os.path.join(CACHE_DIR, f"{alias}.json")
 
     confirm = input(f"¿Estás seguro de eliminar el perfil '{alias}' ({prof})? [s/N]: ")
     if confirm.lower() not in ("s", "si", "y", "yes"):
@@ -712,7 +868,7 @@ def cmd_rm(args):
         return
 
     try:
-        shutil.rmtree(prof)
+        shutil.rmtree(prof, ignore_errors=True)
     except Exception as e:
         print(f"{C_RED}Error al borrar carpeta: {e}{C_RESET}")
 
@@ -722,11 +878,25 @@ def cmd_rm(args):
         except Exception:
             pass
 
-    if get_active_alias() == alias:
-        remaining = [a for a in aliases if a != alias]
-        if remaining:
+    if os.path.lexists(cache_file):
+        try:
+            os.remove(cache_file)
+        except Exception:
+            pass
+
+    remaining = [a for a in aliases if a != alias]
+    if remaining:
+        if get_active_alias() == alias:
             set_active_alias(remaining[0])
             print(f"Cuenta activa reasignada a: {remaining[0]}")
+        if get_default_alias() == alias:
+            set_default_alias(remaining[0])
+            print(f"Cuenta predeterminada reasignada a: {remaining[0]}")
+    else:
+        if os.path.isfile(ACTIVE_FILE):
+            os.remove(ACTIVE_FILE)
+        if os.path.isfile(DEFAULT_FILE):
+            os.remove(DEFAULT_FILE)
 
     sync_launchers()
     print(f"{C_GREEN}✓ Perfil '{alias}' eliminado.{C_RESET}\n")
