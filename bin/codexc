@@ -190,7 +190,7 @@ def attempt_native_token_refresh(alias: str) -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=env,
-            text=True
+            text=False
         )
         init_req = {
             "id": 1,
@@ -202,40 +202,71 @@ def attempt_native_token_refresh(alias: str) -> bool:
             "method": "account/read",
             "params": {"refreshToken": True}
         }
-        p.stdin.write(json.dumps(init_req) + "\n")
-        p.stdin.write(json.dumps(acc_req) + "\n")
-        p.stdin.flush()
+        payload = (json.dumps(init_req) + "\n" + json.dumps(acc_req) + "\n").encode("utf-8")
+        try:
+            p.stdin.write(payload)
+            p.stdin.flush()
+        except Exception:
+            pass
 
         refreshed = False
-        start_t = time.time()
+        start_t = time.monotonic()
         deadline = 6.0  # máximo 6 segundos para responder
+        buffer = b""
 
         is_real_fd = False
+        fd = None
         try:
-            p.stdout.fileno()
+            fd = p.stdout.fileno()
+            os.set_blocking(fd, False)
             is_real_fd = True
         except Exception:
             is_real_fd = False
 
-        while time.time() - start_t < deadline:
-            remaining = max(0.1, deadline - (time.time() - start_t))
+        while time.monotonic() - start_t < deadline:
+            remaining = max(0.05, deadline - (time.monotonic() - start_t))
             if is_real_fd:
-                rlist, _, _ = select.select([p.stdout], [], [], min(0.5, remaining))
-                if not rlist:
+                rlist, _, _ = select.select([fd], [], [], min(0.2, remaining))
+                if rlist:
+                    try:
+                        chunk = os.read(fd, 8192)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                    except (BlockingIOError, InterruptedError):
+                        pass
+                    except Exception:
+                        break
+            else:
+                # Fallback para mocks de prueba o streams sin fd
+                try:
+                    chunk = p.stdout.readline()
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    if not chunk:
+                        break
+                    buffer += chunk
+                except Exception:
+                    break
+
+            # Parsear líneas acumuladas
+            while b"\n" in buffer:
+                line_bytes, buffer = buffer.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if data.get("id") == 2:
+                        res = data.get("result", {})
+                        if res.get("account"):
+                            refreshed = True
+                        break
+                except Exception:
                     continue
 
-            line = p.stdout.readline()
-            if not line:
+            if refreshed:
                 break
-            try:
-                data = json.loads(line)
-                if data.get("id") == 2:
-                    res = data.get("result", {})
-                    if res.get("account"):
-                        refreshed = True
-                    break
-            except Exception:
-                continue
 
         return refreshed
     except Exception:
@@ -244,10 +275,13 @@ def attempt_native_token_refresh(alias: str) -> bool:
         if p is not None:
             try:
                 p.terminate()
-                p.wait(timeout=1)
+                p.wait(timeout=0.8)
             except Exception:
+                pass
+            if p.poll() is None:
                 try:
                     p.kill()
+                    p.wait(timeout=1.0)
                 except Exception:
                     pass
 
