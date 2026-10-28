@@ -11,6 +11,7 @@ import time
 import argparse
 import urllib.request
 import urllib.error
+import urllib.parse
 import shutil
 import subprocess
 import re
@@ -169,18 +170,67 @@ def pad_visible(s: str, width: int) -> str:
     return s + (" " * padding)
 
 def attempt_native_token_refresh(alias: str) -> bool:
-    """Invoca la recuperación interna de Codex CLI para renovar un access token vencido."""
+    """Renueva el access_token usando el endpoint oficial OAuth2 de OpenAI o mediante el runtime de Codex."""
+    auth_file = get_profile_auth_file(alias)
+    if not os.path.isfile(auth_file):
+        return False
+    try:
+        with open(auth_file, "r", encoding="utf-8") as f:
+            auth_data = json.load(f)
+        tokens = auth_data.get("tokens", {})
+        refresh_token = tokens.get("refresh_token")
+        if not refresh_token:
+            return False
+
+        # Client ID oficial del cliente Codex CLI
+        client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+        payload = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://auth.openai.com/oauth/token",
+            data=payload,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "codex-cli/0.164.0"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            new_tokens = json.loads(resp.read().decode("utf-8"))
+
+        if "access_token" in new_tokens:
+            tokens["access_token"] = new_tokens["access_token"]
+            if "refresh_token" in new_tokens:
+                tokens["refresh_token"] = new_tokens["refresh_token"]
+            if "id_token" in new_tokens:
+                tokens["id_token"] = new_tokens["id_token"]
+            auth_data["tokens"] = tokens
+            auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
+
+            tmp_auth = auth_file + f".tmp.{os.getpid()}"
+            with open(tmp_auth, "w", encoding="utf-8") as f:
+                json.dump(auth_data, f, indent=2)
+            os.chmod(tmp_auth, 0o600)
+            os.replace(tmp_auth, auth_file)
+            return True
+    except Exception:
+        pass
+
+    # Fallback secundario mediante runtime de Codex
     prof_dir = get_profile_dir(alias)
     real_bin = get_real_codex_bin()
-    if not os.path.isdir(prof_dir) or not os.path.isfile(real_bin):
-        return False
-    env = os.environ.copy()
-    env["CODEX_HOME"] = prof_dir
-    try:
-        res = subprocess.run([real_bin, "login", "status"], env=env, capture_output=True, text=True, timeout=12)
-        return (res.returncode == 0)
-    except Exception:
-        return False
+    if os.path.isdir(prof_dir) and os.path.isfile(real_bin):
+        env = os.environ.copy()
+        env["CODEX_HOME"] = prof_dir
+        try:
+            res = subprocess.run([real_bin, "doctor"], env=env, capture_output=True, timeout=10)
+            return (res.returncode == 0)
+        except Exception:
+            pass
+    return False
 
 def fetch_codex_usage(alias: str, force_refresh: bool = False, retry_on_401: bool = True) -> dict:
     """Consulta la API en vivo de OpenAI ChatGPT con caché privada y manejo robusto de cuotas ausentes."""
