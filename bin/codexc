@@ -15,6 +15,7 @@ import urllib.parse
 import shutil
 import subprocess
 import re
+import select
 from datetime import datetime, timezone
 
 # Rutas estándar del sistema
@@ -170,120 +171,85 @@ def pad_visible(s: str, width: int) -> str:
     return s + (" " * padding)
 
 def attempt_native_token_refresh(alias: str) -> bool:
-    """Renueva el token de autenticación delegando primariamente al protocolo nativo
-    app-server de Codex (account/read refreshToken=true). Si falla, utiliza renovación
-    OAuth2 con verificación contra cambios concurrentes."""
+    """Renueva el token de autenticación delegando de forma segura y exclusiva al
+    protocolo nativo app-server de Codex (account/read refreshToken=true).
+    Esto garantiza sincronización de locks internos de Codex, cero condiciones de
+    carrera y persistencia oficial."""
     prof_dir = get_profile_dir(alias)
     real_bin = get_real_codex_bin()
-    if os.path.isdir(prof_dir) and os.path.isfile(real_bin):
-        env = os.environ.copy()
-        env["CODEX_HOME"] = prof_dir
-        try:
-            p = subprocess.Popen(
-                [real_bin, "app-server", "--listen", "stdio://"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                text=True
-            )
-            init_req = {
-                "id": 1,
-                "method": "initialize",
-                "params": {"clientInfo": {"name": "codexc", "version": "1.0.0"}}
-            }
-            acc_req = {
-                "id": 2,
-                "method": "account/read",
-                "params": {"refreshToken": True}
-            }
-            p.stdin.write(json.dumps(init_req) + "\n")
-            p.stdin.write(json.dumps(acc_req) + "\n")
-            p.stdin.flush()
-
-            refreshed = False
-            start_t = time.time()
-            while time.time() - start_t < 8:
-                line = p.stdout.readline()
-                if not line:
-                    break
-                try:
-                    data = json.loads(line)
-                    if data.get("id") == 2:
-                        res = data.get("result", {})
-                        if res.get("account"):
-                            refreshed = True
-                        break
-                except Exception:
-                    continue
-            p.terminate()
-            try:
-                p.wait(timeout=2)
-            except Exception:
-                p.kill()
-            if refreshed:
-                return True
-        except Exception:
-            pass
-
-    # Fallback seguro con OAuth2 directo
-    auth_file = get_profile_auth_file(alias)
-    if not os.path.isfile(auth_file):
+    if not (os.path.isdir(prof_dir) and os.path.isfile(real_bin)):
         return False
+
+    env = os.environ.copy()
+    env["CODEX_HOME"] = prof_dir
+    p = None
     try:
-        with open(auth_file, "r", encoding="utf-8") as f:
-            auth_data = json.load(f)
-        orig_refresh = auth_data.get("tokens", {}).get("refresh_token")
-        if not orig_refresh:
-            return False
-
-        # Client ID oficial del cliente Codex CLI
-        client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
-        payload = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "client_id": client_id,
-            "refresh_token": orig_refresh,
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            "https://auth.openai.com/oauth/token",
-            data=payload,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "codex-cli/0.164.0"
-            }
+        p = subprocess.Popen(
+            [real_bin, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            text=True
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            new_tokens = json.loads(resp.read().decode("utf-8"))
+        init_req = {
+            "id": 1,
+            "method": "initialize",
+            "params": {"clientInfo": {"name": "codexc", "version": "1.0.0"}}
+        }
+        acc_req = {
+            "id": 2,
+            "method": "account/read",
+            "params": {"refreshToken": True}
+        }
+        p.stdin.write(json.dumps(init_req) + "\n")
+        p.stdin.write(json.dumps(acc_req) + "\n")
+        p.stdin.flush()
 
-        if "access_token" in new_tokens:
-            # Comprobar concurrencia antes de sobrescribir
-            with open(auth_file, "r", encoding="utf-8") as f:
-                current_auth = json.load(f)
-            curr_refresh = current_auth.get("tokens", {}).get("refresh_token")
-            if curr_refresh != orig_refresh:
-                # El token fue renovado concurrentemente por otro proceso
-                return True
+        refreshed = False
+        start_t = time.time()
+        deadline = 6.0  # máximo 6 segundos para responder
 
-            current_tokens = current_auth.get("tokens", {})
-            current_tokens["access_token"] = new_tokens["access_token"]
-            if "refresh_token" in new_tokens:
-                current_tokens["refresh_token"] = new_tokens["refresh_token"]
-            if "id_token" in new_tokens:
-                current_tokens["id_token"] = new_tokens["id_token"]
-            current_auth["tokens"] = current_tokens
-            current_auth["last_refresh"] = datetime.now(timezone.utc).isoformat()
+        is_real_fd = False
+        try:
+            p.stdout.fileno()
+            is_real_fd = True
+        except Exception:
+            is_real_fd = False
 
-            tmp_auth = auth_file + f".tmp.{os.getpid()}"
-            with open(tmp_auth, "w", encoding="utf-8") as f:
-                json.dump(current_auth, f, indent=2)
-            os.chmod(tmp_auth, 0o600)
-            os.replace(tmp_auth, auth_file)
-            return True
+        while time.time() - start_t < deadline:
+            remaining = max(0.1, deadline - (time.time() - start_t))
+            if is_real_fd:
+                rlist, _, _ = select.select([p.stdout], [], [], min(0.5, remaining))
+                if not rlist:
+                    continue
+
+            line = p.stdout.readline()
+            if not line:
+                break
+            try:
+                data = json.loads(line)
+                if data.get("id") == 2:
+                    res = data.get("result", {})
+                    if res.get("account"):
+                        refreshed = True
+                    break
+            except Exception:
+                continue
+
+        return refreshed
     except Exception:
-        pass
-
-    return False
+        return False
+    finally:
+        if p is not None:
+            try:
+                p.terminate()
+                p.wait(timeout=1)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
 
 def fetch_codex_usage(alias: str, force_refresh: bool = False, retry_on_401: bool = True) -> dict:
     """Consulta la API en vivo de OpenAI ChatGPT con caché privada y manejo robusto de cuotas ausentes."""
