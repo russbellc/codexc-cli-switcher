@@ -482,9 +482,43 @@ def sync_launchers():
     for alias in aliases:
         launcher_path = os.path.join(LOCAL_BIN_DIR, alias)
         content = f"""#!/usr/bin/env bash
-# Lanzador aislado para {alias} generado por codexc
+# Lanzador aislado para {alias} generado por codexc (modo --yolo por defecto)
 export CODEX_HOME="{get_profile_dir(alias)}"
-exec "{real_bin}" "$@"
+
+KNOWN_SUBS=" agents exec review login logout mcp plugin app-server remote-control completion update doctor sandbox debug apply resume queue archive delete migrate-rollouts migrate-nfs-db unarchive fork cloud exec-server features help "
+
+has_yolo=false
+has_no_yolo=false
+is_subcmd=false
+
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--yolo" ] || [ "$arg" = "--dangerously-bypass-approvals-and-sandbox" ]; then
+        has_yolo=true
+    elif [ "$arg" = "--no-yolo" ]; then
+        has_no_yolo=true
+        continue
+    fi
+    ARGS+=("$arg")
+done
+
+for arg in "${{ARGS[@]}}"; do
+    case "$arg" in
+        -*) ;;
+        *)
+            if [[ "$KNOWN_SUBS" =~ " $arg " ]]; then
+                is_subcmd=true
+            fi
+            break
+            ;;
+    esac
+done
+
+if [ "$has_no_yolo" = false ] && [ "$has_yolo" = false ] && [ "$is_subcmd" = false ]; then
+    exec "{real_bin}" --yolo "${{ARGS[@]}}"
+else
+    exec "{real_bin}" "${{ARGS[@]}}"
+fi
 """
         need_write = True
         if os.path.isfile(launcher_path) and not os.path.islink(launcher_path):
@@ -504,7 +538,7 @@ exec "{real_bin}" "$@"
     # 2. Wrapper para el comando estándar 'codex'
     wrapper_path = os.path.join(LOCAL_BIN_DIR, "codex")
     wrapper_content = f"""#!/usr/bin/env bash
-# Wrapper inteligente para 'codex' administrado por codexc
+# Wrapper inteligente para 'codex' administrado por codexc (modo --yolo por defecto)
 REAL_BIN="{real_bin}"
 if [ -z "$CODEX_HOME" ]; then
     ACTIVE_FILE="{ACTIVE_FILE}"
@@ -521,7 +555,41 @@ if [ -z "$CODEX_HOME" ]; then
         export CODEX_HOME="$TARGET_HOME"
     fi
 fi
-exec "$REAL_BIN" "$@"
+
+KNOWN_SUBS=" agents exec review login logout mcp plugin app-server remote-control completion update doctor sandbox debug apply resume queue archive delete migrate-rollouts migrate-nfs-db unarchive fork cloud exec-server features help "
+
+has_yolo=false
+has_no_yolo=false
+is_subcmd=false
+
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--yolo" ] || [ "$arg" = "--dangerously-bypass-approvals-and-sandbox" ]; then
+        has_yolo=true
+    elif [ "$arg" = "--no-yolo" ]; then
+        has_no_yolo=true
+        continue
+    fi
+    ARGS+=("$arg")
+done
+
+for arg in "${{ARGS[@]}}"; do
+    case "$arg" in
+        -*) ;;
+        *)
+            if [[ "$KNOWN_SUBS" =~ " $arg " ]]; then
+                is_subcmd=true
+            fi
+            break
+            ;;
+    esac
+done
+
+if [ "$has_no_yolo" = false ] && [ "$has_yolo" = false ] && [ "$is_subcmd" = false ]; then
+    exec "$REAL_BIN" --yolo "${{ARGS[@]}}"
+else
+    exec "$REAL_BIN" "${{ARGS[@]}}"
+fi
 """
     need_wrapper = True
     if os.path.isfile(wrapper_path) and not os.path.islink(wrapper_path):
