@@ -247,7 +247,8 @@ Este proyecto fue desarrollado y auditado en una sesión de pair-programming col
 
 ## Documentación Adicional
 
-Para detalles avanzados sobre configuración, parámetros de red, integración con scripts de CI/CD y resolución de problemas, consulta el [Manual Completo de Usuario](docs/MANUAL.md).
+- [Manual Completo de Usuario](docs/MANUAL.md) — Instalación, referencia de comandos, uso en paralelo y troubleshooting.
+- [Arquitectura y Funcionalidad Técnica](docs/ARQUITECTURA_Y_FUNCIONALIDAD.md) — Diseño interno de `$CODEX_HOME`, lanzadores `--yolo`, protocolo `codex app-server` JSON-RPC y blueprint de portabilidad a Windows.
 
 ---
 

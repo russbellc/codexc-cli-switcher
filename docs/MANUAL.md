@@ -3,7 +3,8 @@
 
 > **Versión:** v1.2 | **Fecha:** Octubre 2026  
 > **Plataforma:** Linux x86_64 (Ubuntu / Debian / RHEL / Arch)  
-> **Compatibilidad:** OpenAI Codex CLI (standalone & bundled)
+> **Compatibilidad:** OpenAI Codex CLI (standalone & bundled)  
+> **Referencia técnica:** [Arquitectura y Funcionalidad Técnica](ARQUITECTURA_Y_FUNCIONALIDAD.md)
 
 ---
 
