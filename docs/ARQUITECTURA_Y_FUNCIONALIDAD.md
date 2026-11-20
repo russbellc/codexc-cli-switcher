@@ -1,53 +1,67 @@
 # Arquitectura y Funcionalidad de `codexc`
 
-> **Documento técnico de referencia** — Basado en la implementación actual de `bin/codexc`, `install.sh` y `skills/codexc/SKILL.md`.  
-> **Plataforma actual:** Linux x86_64 | **Python:** 3.10+ (biblioteca estándar, cero dependencias externas)
+> **Documento técnico de referencia** — Basado en la implementación actual de [`bin/codexc`](../bin/codexc), [`lib/platform/`](../lib/platform/__init__.py), [`install.sh`](../install.sh), [`install.ps1`](../install.ps1), [`install.cmd`](../install.cmd), [`tests/test_codexc.py`](../tests/test_codexc.py) y [`skills/codexc/SKILL.md`](../skills/codexc/SKILL.md).  
+> **Plataformas soportadas:** Linux x86_64 y Windows 10/11 | **Python:** 3.10+ (biblioteca estándar, cero dependencias externas)
 
 ---
 
 ## 1. Visión general y mapa de componentes
 
-`codexc` es un administrador multi-cuenta y aislador de perfiles para **OpenAI Codex CLI**. Su objetivo es permitir el uso simultáneo y sin colisiones de múltiples suscripciones (por ejemplo `codex01`, `codex02`, ...) en paneles paralelos, monitorear el consumo de cuotas en tiempo real y rotar automáticamente la cuenta activa.
+`codexc` es un administrador multi-cuenta y aislador de perfiles para **OpenAI Codex CLI**. Su objetivo es permitir el uso simultáneo y sin colisiones de múltiples suscripciones (por ejemplo `codex01`, `codex02`, ...) en paneles paralelos, monitorear el consumo de cuotas en tiempo real y rotar automáticamente la cuenta activa en **Linux** y **Windows 10/11**.
 
 | Componente | Ubicación en repo / sistema | Responsabilidad |
 |---|---|---|
-| **CLI principal** | [`bin/codexc`](../bin/codexc) → `~/.local/bin/codexc` | Script Python 3 puro (1143 líneas) que gestiona perfiles, cuotas, caché, renovación nativa de tokens, lanzadores y diagnósticos. |
-| **Lanzadores fijos** | `~/.local/bin/codex01`, `codex02`, ... | Scripts Bash generados automáticamente por `sync_launchers()`. Fijan `CODEX_HOME` al perfil correspondiente e inyectan `--yolo` de forma inteligente. |
-| **Wrapper global** | `~/.local/bin/codex` | Script Bash administrado por `codexc`. Si `CODEX_HOME` no está definido, resuelve el perfil desde `active` → `default` → `codex01` y aplica la misma lógica de `--yolo`. |
-| **Instalador** | [`install.sh`](../install.sh) | Script Bash en 5 pasos: valida Python 3 y Codex CLI, crea directorios base con permisos `0700`, enlaza `codexc` en `~/.local/bin`, instala la skill y ejecuta `codexc doctor`. |
+| **CLI principal** | [`bin/codexc`](../bin/codexc) → `~/.local/bin/codexc` (Linux) o `%USERPROFILE%\.codexc\bin\codexc` + `codexc.cmd` (Windows) | Script Python 3 puro (1537 líneas) que gestiona perfiles, cuotas, caché, renovación nativa de tokens, exportación/importación portable, lanzadores y diagnósticos. |
+| **Capa de plataforma** | [`lib/platform/__init__.py`](../lib/platform/__init__.py), [`linux.py`](../lib/platform/linux.py), [`win32.py`](../lib/platform/win32.py) | Selecciona mediante `IS_WINDOWS = os.name == "nt"` las operaciones nativas de rutas, enlaces (`os.symlink` vs `mklink /J`), permisos, detección de binario real y envoltura de subprocesos. |
+| **Lanzadores fijos** | `~/.local/bin/codex01`, `codex02` (Linux) / `%LOCALAPPDATA%\codexc\bin\codex01.cmd`, `codex02.cmd` (Windows) | Wrappers Bash o `.cmd` generados por `sync_launchers()`. Fijan `CODEX_HOME` al perfil correspondiente e inyectan `--yolo` de forma inteligente. |
+| **Wrapper global** | `~/.local/bin/codex` (Linux) / `%LOCALAPPDATA%\codexc\bin\codex.cmd` (Windows) | Wrapper dinámico administrado por `codexc`. Si `CODEX_HOME` no está definido, resuelve el perfil desde `active` → `default` → `codex01` y aplica la misma lógica de `--yolo`. |
+| **Instaladores** | [`install.sh`](../install.sh) (Linux), [`install.ps1`](../install.ps1) e [`install.cmd`](../install.cmd) (Windows) | Validan Python 3.10+ y Codex CLI, crean directorios base, instalan ejecutables/lanzadores (y `Path` de usuario en Windows), registran la skill y ejecutan `codexc doctor` (y `unittest` en Windows). |
 | **Skill para agentes** | [`skills/codexc/SKILL.md`](../skills/codexc/SKILL.md) | Instrucciones operativas para que agentes autónomos consulten saldos (`list --json`, `quota`), roten cuentas (`auto`, `switch`) y usen lanzadores paralelos. |
+| **Suite de pruebas** | [`tests/test_codexc.py`](../tests/test_codexc.py) | Suite unitaria hermética multiplataforma (`unittest`) ejecutable con `python -m unittest discover -s tests`. |
 
 ---
 
-## 2. Modelo de almacenamiento y aislamiento nativo por `$CODEX_HOME`
+## 2. Modelo de almacenamiento y aislamiento nativo por `CODEX_HOME`
 
 ### Estructura de directorios y archivos
 
-`codexc` toma como raíz real `REAL_HOME = os.environ.get("CODEX_REAL_HOME") or "/home/aidev"` y organiza el estado y los perfiles en dos árboles separados:
+`codexc` resuelve el directorio raíz mediante `REAL_HOME = resolve_real_home()`:
+- En **Linux** (`lib/platform/linux.py`): toma `CODEX_REAL_HOME`, `os.path.expanduser("~")` (si no es `"~"` ni `"/root"`), o `"/home/aidev"`. Los ejecutables y wrappers se ubican en `LOCAL_BIN_DIR = ~/.local/bin`.
+- En **Windows 10/11** (`lib/platform/win32.py`): toma `CODEX_REAL_HOME` o `os.path.expanduser("~")` (`%USERPROFILE%`). Los lanzadores `.cmd` se ubican en `LOCAL_BIN_DIR = %LOCALAPPDATA%\codexc\bin` (o `%USERPROFILE%\.local\bin` si `LOCALAPPDATA` no está definido).
+
+En ambos sistemas organiza el estado y los perfiles en árboles separados:
 
 ```text
-$CODEX_REAL_HOME/
+REAL_HOME/                            (~ en Linux | %USERPROFILE% en Windows)
 ├── .codexc/                          # Estado global y caché de codexc
 │   ├── active                        # Alias actualmente activo para el wrapper 'codex'
 │   ├── default                       # Alias predeterminado de respaldo
-│   └── cache/                        # Permisos 0700
-│       ├── codex01.json              # Caché atómico de cuotas (permisos 0600, TTL 60s)
+│   ├── bin/codexc                    # (Windows) Copia instalada de bin/codexc
+│   ├── lib/platform/                 # (Windows) Copia instalada de la capa de plataforma
+│   └── cache/                        # 0700 en Linux | directorio privado bajo perfil en Windows
+│       ├── codex01.json              # Caché atómico de cuotas (0600 en Linux, TTL 60s)
 │       └── codex02.json
 │
-├── .codexc_homes/                    # Permisos 0700 — Perfiles aislados de Codex CLI
-│   ├── codex01/                      # Permisos 0700 (creado por codexc)
-│   │   ├── auth.json                 # Credenciales OAuth2 de OpenAI (permisos 0600)
-│   │   ├── config.toml               # Configuración TOML copiada/propia del perfil (0600)
-│   │   ├── skills -> ~/.codex/skills # Symlink a las skills globales compartidas
+├── .codexc_homes/                    # Perfiles aislados de Codex CLI (0700 en Linux)
+│   ├── codex01/                      # Directorio aislado del perfil
+│   │   ├── auth.json                 # Credenciales OAuth2 de OpenAI (0600 en Linux)
+│   │   ├── config.toml               # Configuración TOML copiada/propia del perfil
+│   │   ├── skills -> ~/.codex/skills # Symlink (Linux) o NTFS Junction mklink /J (Windows)
 │   │   └── (archivos de Codex CLI)   # state_5.sqlite, goals_1.sqlite, logs_2.sqlite, sesiones, locks
 │   └── codex02/
 │       └── ...
 │
-└── .local/bin/
-    ├── codexc -> .../bin/codexc      # Symlink al script principal
-    ├── codex                         # Wrapper global dinámico
-    ├── codex01                       # Lanzador dedicado para codex01
-    └── codex02                       # Lanzador dedicado para codex02
+├── .local/bin/                       # Linux: directorio de ejecutables y wrappers Bash
+│   ├── codexc -> .../bin/codexc      # Symlink al script principal
+│   ├── codex                         # Wrapper global dinámico Bash
+│   ├── codex01                       # Lanzador dedicado Bash para codex01
+│   └── codex02                       # Lanzador dedicado Bash para codex02
+│
+└── AppData/Local/codexc/bin/         # Windows (%LOCALAPPDATA%\codexc\bin\): wrappers .cmd
+    ├── codexc.cmd                    # Invoca "<sys.executable>" "<codexc>" %*
+    ├── codex.cmd                     # Wrapper global dinámico .cmd
+    ├── codex01.cmd                   # Lanzador dedicado .cmd para codex01
+    └── codex02.cmd                   # Lanzador dedicado .cmd para codex02
 ```
 
 ### Validación de alias y listado (`validate_alias` y `list_aliases`)
@@ -76,33 +90,42 @@ A diferencia de otras herramientas (como `agyc`) que deben reescribir `$HOME` pa
 
 ## 3. Lanzadores paralelos e inyección inteligente de `--yolo`
 
-La función `sync_launchers()` genera y mantiene actualizados (solo reescribiendo si cambia el contenido) los scripts Bash en `~/.local/bin/`:
+La función `sync_launchers()` genera y mantiene actualizados (usando `_write_launcher_if_changed()`, que compara contenido normalizando `\r\n` para evitar escrituras redundantes) los lanzadores según `IS_WINDOWS`:
 
-### Lanzadores dedicados (`codex01`, `codex02`, ...) vs Wrapper global (`codex`)
+### Lanzadores dedicados vs Wrapper global (`codex` / `codex.cmd`) y `codexc`
 
-- **Lanzadores dedicados**: exportan incondicionalmente `export CODEX_HOME="$CODEX_REAL_HOME/.codexc_homes/<alias>"`. Permiten abrir múltiples paneles simultáneos (p. ej. `codex01` en el panel 1 y `codex02` en el panel 2) sin interferencia.
-- **Wrapper `codex`**: solo asigna `CODEX_HOME` si `[ -z "$CODEX_HOME" ]`, resolviendo el alias en cascada:
-  1. Contenido de `~/.codexc/active`
-  2. Contenido de `~/.codexc/default`
-  3. Fallback literal `"codex01"`
-  Si el directorio resultante existe, exporta `CODEX_HOME` antes de invocar al binario real.
+- **En Linux (`IS_WINDOWS == False`):**
+  - **Lanzadores dedicados (`~/.local/bin/codex01`, `codex02`, ...)**: generados por `_build_bash_launcher()`, exportan `export CODEX_HOME="<prof_dir>"` y ejecutan el binario real con detección de `--yolo`.
+  - **Wrapper global (`~/.local/bin/codex`)**: generado por `_build_bash_wrapper()`, solo asigna `CODEX_HOME` si `[ -z "$CODEX_HOME" ]`, resolviendo `ACTIVE_FILE` → `DEFAULT_FILE` → `"codex01"`.
+  - **Enlace global (`~/.local/bin/codexc`)**: symlink hacia `bin/codexc`.
+- **En Windows (`IS_WINDOWS == True`):**
+  - **Lanzadores dedicados (`%LOCALAPPDATA%\codexc\bin\codex01.cmd`, `codex02.cmd`, ...)**: scripts batch con saltos CRLF (`\r\n`) que ejecutan `setlocal`, `set "CODEX_HOME=<prof_dir>"` y el bloque `_build_cmd_launcher_body(real_bin)`.
+  - **Wrapper global (`%LOCALAPPDATA%\codexc\bin\codex.cmd`)**: verifica `if not defined CODEX_HOME`, lee `ACTIVE_FILE` o `DEFAULT_FILE` (con respaldo `"codex01"`) mediante `set /p ACTIVE=<...>` y asigna `CODEX_HOME` si existe el directorio del perfil antes de ejecutar `_build_cmd_launcher_body(real_bin)`.
+  - **Lanzador principal (`%LOCALAPPDATA%\codexc\bin\codexc.cmd`)**: invoca `"<sys.executable>" "<current_script>" %*`.
 
-### Resolución del binario real (`get_real_codex_bin`)
+### Resolución del binario real (`get_real_codex_bin`) y `wrap_codex_command`
 
-Busca el ejecutable oficial de Codex CLI en este orden:
-1. `~/.codex/packages/standalone/current/bin/codex` (si existe y es ejecutable).
-2. `shutil.which("codex")`, excluyendo explícitamente `~/.local/bin/codex` para evitar recursión infinita contra el propio wrapper.
-3. Ruta fallback standalone (`~/.codex/packages/standalone/releases/0.164.0-x86_64-unknown-linux-musl/bin/codex`).
+Delegada a la capa `lib/platform/`:
+- **Linux (`lib/platform/linux.py`):**
+  1. `~/.codex/packages/standalone/current/bin/codex` (si existe y es ejecutable).
+  2. `shutil.which("codex")`, excluyendo `~/.local/bin/codex` para evitar recursión infinita contra el wrapper.
+  3. Ruta fallback standalone (`~/.codex/packages/standalone/releases/0.164.0-x86_64-unknown-linux-musl/bin/codex`).
+- **Windows (`lib/platform/win32.py`):**
+  1. `%USERPROFILE%\.codex\packages\standalone\current\bin\codex.exe` (si existe).
+  2. `shutil.which` en orden `("codex.exe", "codex.cmd", "codex")` pasado por `_resolve_non_ps1_candidate(cand, local_bin_dir)`: descarta cualquier archivo dentro de `LOCAL_BIN_DIR` (`_is_inside_dir`) y evita scripts `.ps1` buscando hermanos `.exe`, `.cmd` o `.bat` en el mismo directorio (previniendo fallos de `ExecutionPolicy` en PowerShell).
+  3. Rutas extra estándar: `%LOCALAPPDATA%\Author Software\nvm\.nodejs\codex.cmd` y `%APPDATA%\npm\codex.cmd`.
+  4. Fallback a la ruta standalone `codex.exe`.
+- **`wrap_codex_command(real_bin, args)`:** en Linux retorna `[real_bin, *args]`; en Windows envuelve archivos `.cmd`/`.bat` con `["cmd", "/c", real_bin, *args]` para que `subprocess.Popen` pueda ejecutarlos correctamente.
 
 ### Detección de subcomandos (`KNOWN_SUBS`) y manejo de flags
 
-Tanto los lanzadores dedicados como el wrapper `codex` procesan todos los argumentos (`"$@"`) antes de ejecutar el binario real:
+Tanto los lanzadores Bash en Linux como `_build_cmd_launcher_body()` en los `.cmd` de Windows procesan todos los argumentos antes de invocar al binario real:
 
 1. **Flags reconocidas**:
-   - `--yolo` o `--dangerously-bypass-approvals-and-sandbox` marcan `has_yolo=true` (se preservan en `ARGS`).
-   - `--no-yolo` marca `has_no_yolo=true` y **se filtra** (no se reenvía al binario real de Codex).
-   - Cualquier otro flag o argumento del usuario se conserva intacto en `ARGS`.
-2. **Detección de subcomandos**:
+   - `--yolo` o `--dangerously-bypass-approvals-and-sandbox` marcan `has_yolo` / `HAS_YOLO=1` (se preservan en los argumentos).
+   - `--no-yolo` marca `has_no_yolo` / `HAS_NO_YOLO=1` y **se filtra** (no se reenvía al binario real de Codex).
+   - Cualquier otro flag o argumento del usuario se conserva intacto.
+2. **Detección de subcomandos (`KNOWN_SUBS_STR`)**:
    El primer argumento posicional (que no comience por `-`) se busca en la lista `KNOWN_SUBS`:
    ```text
    agents, exec, review, login, logout, mcp, plugin, app-server,
@@ -110,10 +133,10 @@ Tanto los lanzadores dedicados como el wrapper `codex` procesan todos los argume
    resume, queue, archive, delete, migrate-rollouts, migrate-nfs-db,
    unarchive, fork, cloud, exec-server, features, help
    ```
-   Si coincide, se marca `is_subcmd=true`.
+   Si coincide, se marca `is_subcmd` / `IS_SUBCMD=1` (`findstr /L /C:" %FIRST_POS% "` en `.cmd`).
 3. **Regla de ejecución**:
-   - Si `has_no_yolo=false`, `has_yolo=false` e `is_subcmd=false`: ejecuta `exec "$REAL_BIN" --yolo "${ARGS[@]}"`.
-   - En cualquier otro caso: ejecuta `exec "$REAL_BIN" "${ARGS[@]}"`.
+   - Si no se pasó `--no-yolo`, ni `--yolo`, ni es subcomando conocido: invoca al binario real anteponiendo `--yolo` (`exec "$REAL_BIN" --yolo "${ARGS[@]}"` en Bash o `call "%REAL_BIN%" --yolo %ARGS%` en `.cmd`).
+   - En cualquier otro caso: ejecuta el binario real con los argumentos originales sin añadir `--yolo`.
 
 ### Comportamiento de `resume` y `fork` entre perfiles
 
@@ -128,12 +151,12 @@ Tanto `resume` como `fork` están incluidos en `KNOWN_SUBS`, por lo que los lanz
 - **Registro nuevo (`codexc add [alias] [--device-auth]`)**:
   1. Si se omite `alias`, calcula el primer correlativo libre `codex01`, `codex02`, ...
   2. Comprueba que el alias no exista aún ni tenga `auth.json`.
-  3. Crea `~/.codexc_homes/<alias>` con modo `0700`, copia `~/.codex/config.toml` (`0600`) si existe y crea el symlink `skills -> ~/.codex/skills` si existe.
-  4. Ejecuta `codex login` (añadiendo `--device-auth` para entornos headless/SSH) con `CODEX_HOME` apuntando al nuevo perfil.
+  3. Crea el directorio del perfil mediante `ensure_private_dir(prof_dir)`, copia `config.toml` con `set_private_file_permissions()` si existe en `SYSTEM_CODEX_DIR` y enlaza `skills` mediante `create_dir_link(skills_src, skills_dst)` (symlink en Linux o NTFS Junction `mklink /J` en Windows).
+  4. Ejecuta `wrap_codex_command(real_bin, ["login", ...])` (añadiendo `--device-auth` para entornos headless/SSH) con `CODEX_HOME` apuntando al nuevo perfil.
   5. Si el usuario cancela o `auth.json` no se genera, elimina el directorio del perfil para no dejar residuos.
-  6. Aplica `chmod 0600` a `auth.json`, verifica duplicados (`email` + `account_id`), sincroniza lanzadores y activa el nuevo perfil.
+  6. Aplica `set_private_file_permissions(auth_file)`, verifica duplicados (`email` + `account_id`), sincroniza lanzadores y activa el nuevo perfil.
 - **Migración automática no destructiva (`ensure_auto_migration`)**:
-  Si no hay ningún perfil registrado todavía (`list_aliases()` vacío) pero existe `~/.codex/auth.json`, `codexc` lo copia a `codex01` (`0600`), copia `config.toml` (`0600`) si existe, enlaza `skills`, establece `codex01` como `active` y `default`, y genera los lanzadores.
+  Si no hay ningún perfil registrado todavía (`list_aliases()` vacío) pero existe `auth.json` en `SYSTEM_CODEX_DIR`, `codexc` lo copia a `codex01` aplicando `set_private_file_permissions()`, copia `config.toml` si existe, enlaza `skills` con `create_dir_link()`, establece `codex01` como `active` y `default`, y genera los lanzadores.
 
 ### Consulta de cuotas en vivo y renovación delegada en `codex app-server`
 
@@ -146,19 +169,21 @@ Tanto `resume` como `fork` están incluidos en `KNOWN_SUBS`, por lo que los lanz
    - `User-Agent: codex-cli/0.164.0`
 2. **Renovación automática ante `HTTP 401` (`attempt_native_token_refresh`)**:
    En lugar de refrescar tokens manualmente compitiendo con sesiones activas, `codexc` delega la renovación en el subproceso nativo de Codex CLI:
-   - Lanza `[real_bin, "app-server", "--listen", "stdio://"]` con `CODEX_HOME=prof_dir`.
+   - Lanza `wrap_codex_command(real_bin, ["app-server", "--listen", "stdio://"])` con `CODEX_HOME=prof_dir` (en Windows envuelve `.cmd`/`.bat` con `cmd /c`).
    - Envía por `stdin` dos peticiones JSON-RPC delimitadas por salto de línea:
      ```json
      {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "codexc", "version": "1.0.0"}}}
      {"id": 2, "method": "account/read", "params": {"refreshToken": true}}
      ```
-   - Lee `stdout` de forma no bloqueante: configura `os.set_blocking(fd, False)` y usa `select.select([fd], [], [], min(0.2, remaining))` + `os.read(fd, 8192)` acumulando en `buffer` (con fallback a `readline()` si el stream no expone descriptor real) bajo un límite estricto de **6.0 segundos**.
-   - Cuando recibe la respuesta JSON-RPC con `"id": 2` y `result.account` presente, da por exitosa la renovación y reintenta `fetch_codex_usage(..., force_refresh=True, retry_on_401=False)` una única vez.
-   - En el bloque `finally`, garantiza la recolección del proceso hijo: `terminate()` → `wait(timeout=0.8)` y, si sigue vivo, `kill()` → `wait(timeout=1.0)`, evitando procesos zombis.
+   - Lee `stdout` sin bloqueos indefinidos bajo un límite estricto de **6.0 segundos** (`deadline = 6.0`), evaluando cada línea con `_parse_account_refresh_line()`:
+     - **Windows (`IS_WINDOWS` o `select is None`)**: lanza un hilo lector demonio (`threading.Thread`, `_reader_worker`) que lee `p.stdout.readline()` y deposita los bytes en `queue.Queue` (`line_queue`); el hilo principal consume mediante `line_queue.get(timeout=min(0.2, remaining))`.
+     - **Linux (`select` disponible)**: configura `os.set_blocking(fd, False)` y usa `select.select([fd], [], [], min(0.2, remaining))` + `os.read(fd, 8192)` acumulando en `buffer` (con respaldo `readline()` si el stream no expone descriptor real).
+   - Cuando `_parse_account_refresh_line()` recibe la respuesta JSON-RPC con `"id": 2` y `result.account` presente, da por exitosa la renovación y reintenta `fetch_codex_usage(..., force_refresh=True, retry_on_401=False)` una única vez.
+   - En el bloque `finally`, cierra `stdin` y garantiza la recolección del proceso hijo: `terminate()` → `wait(timeout=0.8)` y, si sigue vivo, `kill()` → `wait(timeout=1.0)`, evitando procesos zombis.
 
 ### Caché local, normalización y countdowns
 
-- **Caché atómico (`TTL = 60s`)**: las métricas se escriben en `~/.codexc/cache/<alias>.json.tmp.<pid>`, se protegen con `chmod 0600` y se reemplazan atómicamente con `os.replace()`.
+- **Caché atómico (`TTL = 60s`)**: las métricas se escriben en `CACHE_DIR/<alias>.json.tmp.<pid>`, se protegen con `set_private_file_permissions()` y se reemplazan atómicamente con `os.replace()`.
 - **Normalización de ventanas**:
   - `primary_window` (ventana de 5 horas) y `secondary_window` (ventana semanal) calculan:
     `remaining_fraction = max(0.0, min(1.0, (100.0 - float(used_percent)) / 100.0))`
@@ -180,18 +205,46 @@ Tanto `resume` como `fork` están incluidos en `KNOWN_SUBS`, por lo que los lanz
 | `codexc quota [alias]` | Consulta en vivo (`force_refresh=True`) el detalle de 5H y Semanal (porcentaje restante, consumido y tiempo de reinicio) del alias indicado o del activo. |
 | `codexc doctor` | Ejecuta migración automática y `sync_launchers()`. Verifica existencia del binario real de Codex, permisos `0700` de `CACHE_DIR`, cuenta activa/default y estado (`dir`, `auth`, `launcher` ejecutable) de cada perfil. |
 | `codexc rm <alias>` | Solicita confirmación (`[s/N]`), borra `~/.codexc_homes/<alias>`, el lanzador en `~/.local/bin/<alias>` y el caché `<alias>.json`. Reasigna `active` y `default` al primer perfil restante (o los elimina si no quedan perfiles) y sincroniza lanzadores. |
+| `codexc export [alias] [-o <archivo>]` | Ejecuta `cmd_export()`: exporta uno o todos los perfiles (`auth.json` y `config.toml` si existe) en un bundle JSON con `"format": "codexc-bundle-v1"`, `"exported_at"` (UTC) y `"accounts"`, protegido con `set_private_file_permissions()`. Salida por defecto: `codexc-<alias>.json` o `codexc-accounts-bundle.json`. |
+| `codexc import <archivo> [--alias <nuevo>] [--overwrite]` | Ejecuta `cmd_import()`: valida `codexc-bundle-v1`, previene colisiones por alias o identidad (`_extract_auth_identity()` / `_get_existing_profile_identity()`) salvo con `--overwrite`, permite renombrar con `--alias` en bundles de 1 cuenta, escribe `auth.json`/`config.toml`, enlaza `skills/` con `create_dir_link()`, ejecuta `sync_launchers()` y configura `active`/`default` si no existían perfiles previos. |
+
+### Portabilidad entre equipos (`codexc-bundle-v1`) y rotación de `refresh_token`
+
+Los comandos `export` e `import` permiten migrar vinculaciones entre **Windows ↔ Ubuntu Linux** sin repetir `codexc add` en la máquina destino. El flujo recomendado consiste en exportar el bundle, transferirlo por un canal cifrado (por ejemplo `scp`), importarlo en el destino y eliminar el archivo temporal en ambos equipos.
+
+> **Nota sobre concurrencia de sesiones:** Dado que OpenAI puede rotar el `refresh_token` al renovar un `access_token`, si ambos equipos operan simultáneamente sobre la misma cuenta importada, la renovación en una máquina puede invalidar el `refresh_token` de la otra; en tal caso se debe re-exportar e importar con `--overwrite` o asignar cuentas separadas por equipo.
 
 ---
 
-## 6. Guía de Portabilidad a Windows (Blueprint para futura versión Windows)
+## 6. Implementación Multiplataforma (`lib/platform/`) y Validación (`tests/test_codexc.py`)
 
-Esta sección documenta los equivalentes exactos requeridos para portar `codexc` a **Windows 10/11** manteniendo la misma arquitectura de aislamiento por `CODEX_HOME`:
+El soporte nativo para **Linux** y **Windows 10/11** está implementado mediante la capa [`lib/platform/__init__.py`](../lib/platform/__init__.py), que expone una interfaz unificada seleccionando [`lib/platform/linux.py`](../lib/platform/linux.py) o [`lib/platform/win32.py`](../lib/platform/win32.py) según `IS_WINDOWS = os.name == "nt"`:
 
-| Pieza / Mecanismo | Implementación actual en Linux | Equivalente exacto en Windows 10/11 |
+| Pieza / Mecanismo | Implementación en Linux (`linux.py`) | Implementación en Windows 10/11 (`win32.py`) |
 |---|---|---|
-| **Directorio base del usuario (`REAL_HOME`)** | `CODEX_REAL_HOME` o `/home/aidev`; rutas `~/.codexc`, `~/.codexc_homes`, `~/.local/bin`. | `CODEX_REAL_HOME` o `%USERPROFILE%` (`os.path.expanduser("~")`); rutas `%USERPROFILE%\.codexc` y `%USERPROFILE%\.codexc_homes`. |
-| **Binario oficial de Codex CLI** | `~/.codex/packages/standalone/current/bin/codex` o `shutil.which("codex")`. | `codex.exe` (instalación standalone) o `codex.cmd` (instalación global vía `npm`). **Importante:** resolver explícitamente `.exe`/`.cmd` evitando invocar `codex.ps1`, que suele fallar en PowerShell por restricciones de `ExecutionPolicy`. |
-| **Lanzadores paralelos y wrapper** | Scripts Bash ejecutables (`chmod 0755`) en `~/.local/bin/codex01`, `codex02`, `codex` usando `export CODEX_HOME=...` y arreglo `ARGS`. | Scripts `.cmd` / `.bat` (`codex01.cmd`, `codex02.cmd`, `codex.cmd`) en `%USERPROFILE%\.local\bin` o `%LOCALAPPDATA%\codexc\bin` (añadido al `PATH` del usuario), usando `set "CODEX_HOME=..."` y replicando la lógica de detección `KNOWN_SUBS`, `--yolo` y `--no-yolo`. |
-| **Enlace compartido de `skills/`** | `os.symlink(skills_src, skills_dst)` hacia `~/.codex/skills`. | **NTFS Junction** mediante `cmd /c mklink /J "<dst>" "<src>"` (a diferencia de los symlinks simbólicos en Windows, un *Junction* de directorio no requiere privilegios de Administrador ni Developer Mode). |
-| **I/O no bloqueante con `codex app-server`** | `os.set_blocking(fd, False)` + `select.select([fd], ...)` + `os.read(fd, 8192)`. | **`select.select` NO funciona sobre pipes ni descriptores de subprocesos en Windows** (solo sobre sockets). Se debe reemplazar por un hilo lector (`threading.Thread`) que lea líneas de `p.stdout` y las deposite en `queue.Queue` (o `asyncio.create_subprocess_exec` con `asyncio.wait_for`), conservando el timeout de 6s y la terminación/limpieza en `finally`. |
-| **Permisos de seguridad (`0700` / `0600`)** | `os.makedirs(..., mode=0o700)` y `os.chmod(..., 0o600)`. | En Windows `os.chmod` solo controla el bit de solo lectura. Proteger los archivos heredando permisos privados bajo `%USERPROFILE%` y, opcionalmente, aplicar ACLs NTFS explícitas mediante `icacls "<ruta>" /inheritance:r /grant:r "%USERNAME%:F"`. |
+| **Directorio base (`resolve_real_home`)** | `CODEX_REAL_HOME`, `os.path.expanduser("~")` (si no es `"~"` ni `"/root"`), o `"/home/aidev"`. | `CODEX_REAL_HOME` o `os.path.expanduser("~")` (`%USERPROFILE%`). |
+| **Directorio de lanzadores (`get_local_bin_dir`)** | `~/.local/bin` | `%LOCALAPPDATA%\codexc\bin` (con respaldo `~/.local/bin` si `LOCALAPPDATA` no existe). |
+| **Binario real (`get_real_codex_bin`)** | `~/.codex/packages/standalone/current/bin/codex`, `shutil.which("codex")` (excluyendo wrapper) o fallback standalone. | `%USERPROFILE%\.codex\...\codex.exe`, `shutil.which` (`codex.exe`, `codex.cmd`, `codex`) filtrando `.ps1` y `LOCAL_BIN_DIR` via `_resolve_non_ps1_candidate()`, o rutas de `nvm`/`npm` (`codex.cmd`). |
+| **Lanzadores y wrappers (`sync_launchers`, `get_launcher_path`)** | Scripts Bash (`0755`) en `~/.local/bin/codex01`, `codex` y symlink `codexc`. | Wrappers `.cmd` (`codex01.cmd`, `codex.cmd`, `codexc.cmd`) en `%LOCALAPPDATA%\codexc\bin` con `set "CODEX_HOME=..."`, `KNOWN_SUBS`, `--yolo` y `--no-yolo`. |
+| **Invocación en subprocesos (`wrap_codex_command`)** | `[real_bin, *args]` | Antepone `["cmd", "/c", real_bin, *args]` cuando `real_bin` termina en `.cmd` o `.bat`. |
+| **Enlace compartido de `skills/` (`create_dir_link`)** | `os.symlink(src, dst)` hacia `~/.codex/skills`. | **NTFS Junction** mediante `cmd /c mklink /J <dst> <src>` (no requiere privilegios de Administrador ni Developer Mode). |
+| **I/O no bloqueante con `app-server`** | `os.set_blocking(fd, False)` + `select.select([fd], ...)` + `os.read(fd, 8192)`. | Hilo lector demonio `threading.Thread` (`_reader_worker`) leyendo `p.stdout.readline()` hacia `queue.Queue` con timeout, manteniendo el límite de 6.0s y recolección en `finally`. |
+| **Permisos y estado (`ensure_private_dir`, `get_dir_security_status`)** | `0700` para directorios privados, `0600` para archivos sensibles (`"0700"` / `"aviso"` en `doctor`). | Directorios privados bajo `%USERPROFILE%`, `os.chmod(path, 0o600)` tolerante a NTFS y estado `"NTFS privado"` / `"aviso"` en `doctor`. |
+
+### Suite de pruebas unitarias ([`tests/test_codexc.py`](../tests/test_codexc.py))
+
+La verificación automatizada se implementa en [`tests/test_codexc.py`](../tests/test_codexc.py) con **16 tests** usando `unittest` y directorios temporales herméticos (`CodexcTestCase`) sin tocar perfiles reales ni realizar llamadas de red reales:
+
+- `TestValidateAliasAndList` (3 tests): validación de alias, rechazo de nombres reservados/inseguros y filtrado en `list_aliases()`.
+- `TestAutoMigration` (1 test): migración no destructiva hacia `codex01` y enlace de `skills/` (`ensure_auto_migration()`).
+- `TestNativeTokenRefresh` (2 tests): pruebas de `attempt_native_token_refresh()` con pipe real en hilo escritor y respuesta JSON-RPC sin cuenta.
+- `TestSyncLaunchers` (2 tests): generación de wrappers `.cmd` en Windows (incluyendo ejecución real con `cmd /c` en Windows para `--yolo`, `--no-yolo` y subcomandos `exec`) y generación de scripts Bash en Linux.
+- `TestFetchUsageAndRotation` (4 tests): lectura de caché dentro del TTL de 60s, flujo `HTTP 401` → `attempt_native_token_refresh()` → reintento, selección óptima en `cmd_auto` y limpieza en `cmd_rm`.
+- `TestExportAndImport` (3 tests): exportación individual e importación con `--alias`, rechazo de duplicados/existentes sin `--overwrite` y actualización con `--overwrite`, y exportación completa con nombre por defecto `codexc-accounts-bundle.json`.
+- `TestWin32PlatformHelpers` (1 test): verificación de que `platform_win32.get_real_codex_bin()` ignora `.ps1` y el wrapper propio en `local_bin`, resolviendo `codex.cmd` real.
+
+Ejecución en Linux o Windows:
+
+```bash
+python -m unittest discover -s tests
+```

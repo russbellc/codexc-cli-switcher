@@ -15,19 +15,57 @@ import urllib.parse
 import shutil
 import subprocess
 import re
-import select
+import queue
+import threading
 from datetime import datetime, timezone
 
+if os.name != "nt":
+    import select
+else:
+    select = None
+
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
+for _lib_candidate in (
+    os.path.join(_REPO_ROOT, "lib"),
+    os.path.join(_SCRIPT_DIR, "lib"),
+    os.path.join(os.path.expanduser("~"), ".codexc", "lib"),
+):
+    if os.path.isdir(os.path.join(_lib_candidate, "platform")):
+        _parent = os.path.dirname(_lib_candidate)
+        if _parent not in sys.path:
+            sys.path.insert(0, _parent)
+        break
+
+from lib.platform import (
+    IS_WINDOWS,
+    create_dir_link,
+    ensure_private_dir,
+    ensure_public_dir,
+    get_dir_security_status,
+    get_launcher_path,
+    get_local_bin_dir,
+    get_real_codex_bin as _platform_get_real_codex_bin,
+    is_executable,
+    resolve_real_home,
+    set_executable_permissions,
+    set_private_file_permissions,
+    wrap_codex_command,
+)
+
 # Rutas estándar del sistema
-REAL_HOME = os.environ.get("CODEX_REAL_HOME") or "/home/aidev"
+REAL_HOME = resolve_real_home()
 CODEXC_DIR = os.path.join(REAL_HOME, ".codexc")
 CACHE_DIR = os.path.join(CODEXC_DIR, "cache")
 HOMES_DIR = os.path.join(REAL_HOME, ".codexc_homes")
 ACTIVE_FILE = os.path.join(CODEXC_DIR, "active")
 DEFAULT_FILE = os.path.join(CODEXC_DIR, "default")
 SYSTEM_CODEX_DIR = os.path.join(REAL_HOME, ".codex")
-CENTRAL_CODEX_BIN = os.path.join(SYSTEM_CODEX_DIR, "packages", "standalone", "current", "bin", "codex")
-LOCAL_BIN_DIR = os.path.join(REAL_HOME, ".local", "bin")
+CENTRAL_CODEX_BIN = os.path.join(
+    SYSTEM_CODEX_DIR, "packages", "standalone", "current", "bin",
+    "codex.exe" if IS_WINDOWS else "codex",
+)
+LOCAL_BIN_DIR = get_local_bin_dir(REAL_HOME)
 
 CACHE_TTL_SECONDS = 60
 RESERVED_NAMES = {
@@ -63,18 +101,13 @@ def validate_alias(alias: str) -> str:
     return cleaned
 
 def ensure_base_dirs():
-    os.makedirs(CODEXC_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(HOMES_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(LOCAL_BIN_DIR, mode=0o755, exist_ok=True)
+    ensure_private_dir(CODEXC_DIR)
+    ensure_private_dir(CACHE_DIR)
+    ensure_private_dir(HOMES_DIR)
+    ensure_public_dir(LOCAL_BIN_DIR)
 
 def get_real_codex_bin() -> str:
-    if os.path.isfile(CENTRAL_CODEX_BIN) and os.access(CENTRAL_CODEX_BIN, os.X_OK):
-        return CENTRAL_CODEX_BIN
-    cand = shutil.which("codex")
-    if cand and os.path.realpath(cand) != os.path.realpath(os.path.join(LOCAL_BIN_DIR, "codex")):
-        return cand
-    return "/home/aidev/.codex/packages/standalone/releases/0.164.0-x86_64-unknown-linux-musl/bin/codex"
+    return _platform_get_real_codex_bin(REAL_HOME, LOCAL_BIN_DIR)
 
 def list_aliases() -> list[str]:
     ensure_base_dirs()
@@ -170,6 +203,21 @@ def pad_visible(s: str, width: int) -> str:
     padding = max(0, width - vis_len)
     return s + (" " * padding)
 
+def _parse_account_refresh_line(line_bytes: bytes) -> bool:
+    """Evalúa una línea JSON-RPC de app-server para confirmar account/read."""
+    line = line_bytes.decode("utf-8", errors="replace").strip()
+    if not line:
+        return False
+    try:
+        data = json.loads(line)
+        if data.get("id") == 2:
+            res = data.get("result", {})
+            return bool(res.get("account"))
+    except Exception:
+        return False
+    return False
+
+
 def attempt_native_token_refresh(alias: str) -> bool:
     """Renueva el token de autenticación delegando de forma segura y exclusiva al
     protocolo nativo app-server de Codex (account/read refreshToken=true).
@@ -182,25 +230,26 @@ def attempt_native_token_refresh(alias: str) -> bool:
 
     env = os.environ.copy()
     env["CODEX_HOME"] = prof_dir
+    cmd = wrap_codex_command(real_bin, ["app-server", "--listen", "stdio://"])
     p = None
     try:
         p = subprocess.Popen(
-            [real_bin, "app-server", "--listen", "stdio://"],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=env,
-            text=False
+            text=False,
         )
         init_req = {
             "id": 1,
             "method": "initialize",
-            "params": {"clientInfo": {"name": "codexc", "version": "1.0.0"}}
+            "params": {"clientInfo": {"name": "codexc", "version": "1.0.0"}},
         }
         acc_req = {
             "id": 2,
             "method": "account/read",
-            "params": {"refreshToken": True}
+            "params": {"refreshToken": True},
         }
         payload = (json.dumps(init_req) + "\n" + json.dumps(acc_req) + "\n").encode("utf-8")
         try:
@@ -212,67 +261,95 @@ def attempt_native_token_refresh(alias: str) -> bool:
         refreshed = False
         start_t = time.monotonic()
         deadline = 6.0  # máximo 6 segundos para responder
-        buffer = b""
 
-        is_real_fd = False
-        fd = None
-        try:
-            fd = p.stdout.fileno()
-            os.set_blocking(fd, False)
-            is_real_fd = True
-        except Exception:
+        if IS_WINDOWS or select is None:
+            line_queue: queue.Queue[bytes | None] = queue.Queue()
+
+            def _reader_worker():
+                try:
+                    while True:
+                        raw = p.stdout.readline()
+                        if isinstance(raw, str):
+                            raw = raw.encode("utf-8")
+                        if not raw:
+                            break
+                        line_queue.put(raw)
+                except Exception:
+                    pass
+                finally:
+                    line_queue.put(None)
+
+            reader = threading.Thread(target=_reader_worker, daemon=True)
+            reader.start()
+
+            while time.monotonic() - start_t < deadline:
+                remaining = max(0.05, deadline - (time.monotonic() - start_t))
+                try:
+                    item = line_queue.get(timeout=min(0.2, remaining))
+                except queue.Empty:
+                    continue
+                if item is None:
+                    break
+                if _parse_account_refresh_line(item):
+                    refreshed = True
+                    break
+        else:
+            buffer = b""
             is_real_fd = False
+            fd = None
+            try:
+                fd = p.stdout.fileno()
+                os.set_blocking(fd, False)
+                is_real_fd = True
+            except Exception:
+                is_real_fd = False
 
-        while time.monotonic() - start_t < deadline:
-            remaining = max(0.05, deadline - (time.monotonic() - start_t))
-            if is_real_fd:
-                rlist, _, _ = select.select([fd], [], [], min(0.2, remaining))
-                if rlist:
+            while time.monotonic() - start_t < deadline:
+                remaining = max(0.05, deadline - (time.monotonic() - start_t))
+                if is_real_fd:
+                    rlist, _, _ = select.select([fd], [], [], min(0.2, remaining))
+                    if rlist:
+                        try:
+                            chunk = os.read(fd, 8192)
+                            if not chunk:
+                                break
+                            buffer += chunk
+                        except (BlockingIOError, InterruptedError):
+                            pass
+                        except Exception:
+                            break
+                else:
+                    # Fallback para mocks de prueba o streams sin fd
                     try:
-                        chunk = os.read(fd, 8192)
+                        chunk = p.stdout.readline()
+                        if isinstance(chunk, str):
+                            chunk = chunk.encode("utf-8")
                         if not chunk:
                             break
                         buffer += chunk
-                    except (BlockingIOError, InterruptedError):
-                        pass
                     except Exception:
                         break
-            else:
-                # Fallback para mocks de prueba o streams sin fd
-                try:
-                    chunk = p.stdout.readline()
-                    if isinstance(chunk, str):
-                        chunk = chunk.encode("utf-8")
-                    if not chunk:
+
+                # Parsear líneas acumuladas
+                while b"\n" in buffer:
+                    line_bytes, buffer = buffer.split(b"\n", 1)
+                    if _parse_account_refresh_line(line_bytes):
+                        refreshed = True
                         break
-                    buffer += chunk
-                except Exception:
+
+                if refreshed:
                     break
-
-            # Parsear líneas acumuladas
-            while b"\n" in buffer:
-                line_bytes, buffer = buffer.split(b"\n", 1)
-                line = line_bytes.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    if data.get("id") == 2:
-                        res = data.get("result", {})
-                        if res.get("account"):
-                            refreshed = True
-                        break
-                except Exception:
-                    continue
-
-            if refreshed:
-                break
 
         return refreshed
     except Exception:
         return False
     finally:
         if p is not None:
+            try:
+                if p.stdin:
+                    p.stdin.close()
+            except Exception:
+                pass
             try:
                 p.terminate()
                 p.wait(timeout=0.8)
@@ -430,7 +507,7 @@ def fetch_codex_usage(alias: str, force_refresh: bool = False, retry_on_401: boo
         tmp_cache = cache_file + f".tmp.{os.getpid()}"
         with open(tmp_cache, "w", encoding="utf-8") as f:
             json.dump(metrics, f)
-        os.chmod(tmp_cache, 0o600)
+        set_private_file_permissions(tmp_cache)
         os.replace(tmp_cache, cache_file)
     except Exception:
         pass
@@ -447,45 +524,113 @@ def ensure_auto_migration():
         return
 
     prof_dir = get_profile_dir("codex01")
-    os.makedirs(prof_dir, mode=0o700, exist_ok=True)
+    ensure_private_dir(prof_dir)
 
     auth_dst = os.path.join(prof_dir, "auth.json")
     if not os.path.exists(auth_dst):
         shutil.copy2(auth_src, auth_dst)
-        os.chmod(auth_dst, 0o600)
+        set_private_file_permissions(auth_dst)
 
     cfg_src = os.path.join(SYSTEM_CODEX_DIR, "config.toml")
     cfg_dst = os.path.join(prof_dir, "config.toml")
     if os.path.isfile(cfg_src) and not os.path.exists(cfg_dst):
         shutil.copy2(cfg_src, cfg_dst)
-        os.chmod(cfg_dst, 0o600)
+        set_private_file_permissions(cfg_dst)
 
     skills_src = os.path.join(SYSTEM_CODEX_DIR, "skills")
     skills_dst = os.path.join(prof_dir, "skills")
     if os.path.isdir(skills_src) and not os.path.exists(skills_dst):
-        try:
-            os.symlink(skills_src, skills_dst)
-        except Exception:
-            pass
+        create_dir_link(skills_src, skills_dst)
 
     set_active_alias("codex01")
     set_default_alias("codex01")
     sync_launchers()
 
-def sync_launchers():
-    """Sincroniza binarios lanzadores sin escrituras redundantes ni sobreescritura de symlinks ajenos."""
-    ensure_base_dirs()
-    real_bin = get_real_codex_bin()
-    aliases = list_aliases()
 
-    # 1. Lanzador por cada cuenta (codex01, codex02...)
-    for alias in aliases:
-        launcher_path = os.path.join(LOCAL_BIN_DIR, alias)
-        content = f"""#!/usr/bin/env bash
+KNOWN_SUBS_STR = (
+    " agents exec review login logout mcp plugin app-server remote-control "
+    "completion update doctor sandbox debug apply resume queue archive delete "
+    "migrate-rollouts migrate-nfs-db unarchive fork cloud exec-server features help "
+)
+
+
+def _write_launcher_if_changed(path: str, content: str, newline: str | None = None) -> None:
+    """Escribe un lanzador solo si su contenido cambió, evitando escrituras redundantes."""
+    need_write = True
+    if os.path.isfile(path) and not os.path.islink(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                if f.read().replace("\r\n", "\n") == content.replace("\r\n", "\n"):
+                    need_write = False
+        except Exception:
+            pass
+    if need_write:
+        if os.path.islink(path):
+            os.remove(path)
+        with open(path, "w", encoding="utf-8", newline=newline) as f:
+            f.write(content)
+        set_executable_permissions(path)
+
+
+def _build_cmd_launcher_body(real_bin: str) -> str:
+    """Genera el bloque común de parseo de argumentos y --yolo para lanzadores .cmd."""
+    return f"""set "REAL_BIN={real_bin}"
+set "KNOWN_SUBS={KNOWN_SUBS_STR}"
+
+set "HAS_YOLO=0"
+set "HAS_NO_YOLO=0"
+set "IS_SUBCMD=0"
+set "FIRST_POS="
+set "ARGS="
+
+:parse_loop
+if "%~1"=="" goto after_parse
+set "ARG=%~1"
+if "%ARG%"=="--yolo" goto mark_yolo
+if "%ARG%"=="--dangerously-bypass-approvals-and-sandbox" goto mark_yolo
+if "%ARG%"=="--no-yolo" goto mark_no_yolo
+set "ARGS=%ARGS% %1"
+if defined FIRST_POS goto next_arg
+if "%ARG:~0,1%"=="-" goto next_arg
+set "FIRST_POS=%ARG%"
+goto next_arg
+
+:mark_yolo
+set "HAS_YOLO=1"
+set "ARGS=%ARGS% %1"
+goto next_arg
+
+:mark_no_yolo
+set "HAS_NO_YOLO=1"
+
+:next_arg
+shift
+goto parse_loop
+
+:after_parse
+if not defined FIRST_POS goto check_yolo
+echo "%KNOWN_SUBS%" | findstr /L /C:" %FIRST_POS% " >nul 2>&1
+if not errorlevel 1 set "IS_SUBCMD=1"
+
+:check_yolo
+if "%HAS_NO_YOLO%"=="0" if "%HAS_YOLO%"=="0" if "%IS_SUBCMD%"=="0" goto run_yolo
+ver >nul
+call "%REAL_BIN%" %ARGS%
+exit /b %ERRORLEVEL%
+
+:run_yolo
+ver >nul
+call "%REAL_BIN%" --yolo %ARGS%
+exit /b %ERRORLEVEL%
+"""
+
+
+def _build_bash_launcher(alias: str, prof_dir: str, real_bin: str) -> str:
+    return f"""#!/usr/bin/env bash
 # Lanzador aislado para {alias} generado por codexc (modo --yolo por defecto)
-export CODEX_HOME="{get_profile_dir(alias)}"
+export CODEX_HOME="{prof_dir}"
 
-KNOWN_SUBS=" agents exec review login logout mcp plugin app-server remote-control completion update doctor sandbox debug apply resume queue archive delete migrate-rollouts migrate-nfs-db unarchive fork cloud exec-server features help "
+KNOWN_SUBS="{KNOWN_SUBS_STR}"
 
 has_yolo=false
 has_no_yolo=false
@@ -520,24 +665,10 @@ else
     exec "{real_bin}" "${{ARGS[@]}}"
 fi
 """
-        need_write = True
-        if os.path.isfile(launcher_path) and not os.path.islink(launcher_path):
-            try:
-                with open(launcher_path, "r", encoding="utf-8") as f:
-                    if f.read() == content:
-                        need_write = False
-            except Exception:
-                pass
-        if need_write:
-            if os.path.islink(launcher_path):
-                os.remove(launcher_path)
-            with open(launcher_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            os.chmod(launcher_path, 0o755)
 
-    # 2. Wrapper para el comando estándar 'codex'
-    wrapper_path = os.path.join(LOCAL_BIN_DIR, "codex")
-    wrapper_content = f"""#!/usr/bin/env bash
+
+def _build_bash_wrapper(real_bin: str) -> str:
+    return f"""#!/usr/bin/env bash
 # Wrapper inteligente para 'codex' administrado por codexc (modo --yolo por defecto)
 REAL_BIN="{real_bin}"
 if [ -z "$CODEX_HOME" ]; then
@@ -556,7 +687,7 @@ if [ -z "$CODEX_HOME" ]; then
     fi
 fi
 
-KNOWN_SUBS=" agents exec review login logout mcp plugin app-server remote-control completion update doctor sandbox debug apply resume queue archive delete migrate-rollouts migrate-nfs-db unarchive fork cloud exec-server features help "
+KNOWN_SUBS="{KNOWN_SUBS_STR}"
 
 has_yolo=false
 has_no_yolo=false
@@ -591,25 +722,75 @@ else
     exec "$REAL_BIN" "${{ARGS[@]}}"
 fi
 """
-    need_wrapper = True
-    if os.path.isfile(wrapper_path) and not os.path.islink(wrapper_path):
-        try:
-            with open(wrapper_path, "r", encoding="utf-8") as f:
-                if f.read() == wrapper_content:
-                    need_wrapper = False
-        except Exception:
-            pass
 
-    if need_wrapper:
-        if os.path.islink(wrapper_path):
-            os.remove(wrapper_path)
-        with open(wrapper_path, "w", encoding="utf-8") as f:
-            f.write(wrapper_content)
-        os.chmod(wrapper_path, 0o755)
+
+def sync_launchers():
+    """Sincroniza binarios lanzadores sin escrituras redundantes ni sobreescritura de symlinks ajenos."""
+    ensure_base_dirs()
+    real_bin = get_real_codex_bin()
+    aliases = list_aliases()
+    current_script = os.path.realpath(os.path.abspath(__file__))
+
+    if IS_WINDOWS:
+        # 1. Lanzadores .cmd por cada cuenta (codex01.cmd, codex02.cmd...)
+        for alias in aliases:
+            launcher_path = get_launcher_path(LOCAL_BIN_DIR, alias)
+            prof_dir = get_profile_dir(alias)
+            content = (
+                "@echo off\n"
+                "setlocal\n"
+                f'rem Lanzador aislado para {alias} generado por codexc (modo --yolo por defecto)\n'
+                f'set "CODEX_HOME={prof_dir}"\n'
+                + _build_cmd_launcher_body(real_bin)
+            )
+            _write_launcher_if_changed(launcher_path, content, newline="\r\n")
+
+        # 2. Wrapper codex.cmd
+        wrapper_path = os.path.join(LOCAL_BIN_DIR, "codex.cmd")
+        wrapper_content = (
+            "@echo off\n"
+            "setlocal\n"
+            "rem Wrapper inteligente para 'codex' administrado por codexc (modo --yolo por defecto)\n"
+            "if not defined CODEX_HOME (\n"
+            '    set "ACTIVE="\n'
+            f'    if exist "{ACTIVE_FILE}" (\n'
+            f'        set /p ACTIVE=<"{ACTIVE_FILE}"\n'
+            f'    ) else if exist "{DEFAULT_FILE}" (\n'
+            f'        set /p ACTIVE=<"{DEFAULT_FILE}"\n'
+            "    ) else (\n"
+            '        set "ACTIVE=codex01"\n'
+            "    )\n"
+            '    if not defined ACTIVE set "ACTIVE=codex01"\n'
+            '    set "ACTIVE=%ACTIVE: =%"\n'
+            f'    if exist "{HOMES_DIR}\\%ACTIVE%" (\n'
+            f'        set "CODEX_HOME={HOMES_DIR}\\%ACTIVE%"\n'
+            "    )\n"
+            ")\n"
+            + _build_cmd_launcher_body(real_bin)
+        )
+        _write_launcher_if_changed(wrapper_path, wrapper_content, newline="\r\n")
+
+        # 3. Lanzador global codexc.cmd
+        codexc_cmd_path = os.path.join(LOCAL_BIN_DIR, "codexc.cmd")
+        codexc_cmd_content = (
+            "@echo off\n"
+            f'"{sys.executable}" "{current_script}" %*\n'
+        )
+        _write_launcher_if_changed(codexc_cmd_path, codexc_cmd_content, newline="\r\n")
+        return
+
+    # Linux / POSIX
+    for alias in aliases:
+        launcher_path = get_launcher_path(LOCAL_BIN_DIR, alias)
+        content = _build_bash_launcher(alias, get_profile_dir(alias), real_bin)
+        _write_launcher_if_changed(launcher_path, content)
+
+    wrapper_path = os.path.join(LOCAL_BIN_DIR, "codex")
+    wrapper_content = _build_bash_wrapper(real_bin)
+    _write_launcher_if_changed(wrapper_path, wrapper_content)
 
     # 3. Symlink global para 'codexc'
     codexc_target = os.path.join(LOCAL_BIN_DIR, "codexc")
-    current_script = os.path.realpath(os.path.abspath(__file__))
     target_abs = os.path.abspath(codexc_target)
     if current_script != target_abs:
         need_link = True
@@ -815,7 +996,7 @@ def cmd_add(args):
         print(f"Para re-autenticar usa 'codexc login {alias}', o elimina el perfil primero con 'codexc rm {alias}'.\n")
         sys.exit(1)
 
-    os.makedirs(prof_dir, mode=0o700, exist_ok=True)
+    ensure_private_dir(prof_dir)
 
     # Copiar configuración base si no existe
     cfg_dst = os.path.join(prof_dir, "config.toml")
@@ -823,17 +1004,14 @@ def cmd_add(args):
         cfg_src = os.path.join(SYSTEM_CODEX_DIR, "config.toml")
         if os.path.isfile(cfg_src):
             shutil.copy2(cfg_src, cfg_dst)
-            os.chmod(cfg_dst, 0o600)
+            set_private_file_permissions(cfg_dst)
 
     # Enlazar skills si existen
     skills_dst = os.path.join(prof_dir, "skills")
     if not os.path.exists(skills_dst):
         skills_src = os.path.join(SYSTEM_CODEX_DIR, "skills")
         if os.path.isdir(skills_src):
-            try:
-                os.symlink(skills_src, skills_dst)
-            except Exception:
-                pass
+            create_dir_link(skills_src, skills_dst)
 
     real_bin = get_real_codex_bin()
     print(f"\n{C_BOLD}{C_CYAN}▶ Iniciando vinculación de cuenta para '{alias}'...{C_RESET}")
@@ -842,9 +1020,10 @@ def cmd_add(args):
     env = os.environ.copy()
     env["CODEX_HOME"] = prof_dir
 
-    login_cmd = [real_bin, "login"]
+    login_args = ["login"]
     if getattr(args, "device_auth", False):
-        login_cmd.append("--device-auth")
+        login_args.append("--device-auth")
+    login_cmd = wrap_codex_command(real_bin, login_args)
 
     try:
         subprocess.run(login_cmd, env=env, check=True)
@@ -860,7 +1039,7 @@ def cmd_add(args):
         print(f"\n{C_RED}Error:{C_RESET} No se generó el archivo auth.json en {prof_dir}.\n")
         sys.exit(1)
 
-    os.chmod(auth_file, 0o600)
+    set_private_file_permissions(auth_file)
 
     # Validar cuota e identidad de la nueva cuenta
     usage = fetch_codex_usage(alias, force_refresh=True)
@@ -990,9 +1169,9 @@ def cmd_doctor(args):
     sync_launchers()
     print(f"\n{C_BOLD}{C_WHITE}DIAGNÓSTICO DE CODEXC SWITCHER{C_RESET}\n")
     real_bin = get_real_codex_bin()
-    print(f"  Binario real de Codex:  {real_bin} ({'✓ Encontrado' if os.path.isfile(real_bin) else '✗ NO ENCONTRADO'})")
+    print(f"  Binario real de Codex:  {real_bin} ({'✓ Encontrado' if is_executable(real_bin) else '✗ NO ENCONTRADO'})")
     print(f"  Directorio de perfiles: {HOMES_DIR}")
-    print(f"  Directorio de caché:    {CACHE_DIR} ({'0700' if oct(os.stat(CACHE_DIR).st_mode & 0o777) == '0o700' else 'aviso'})")
+    print(f"  Directorio de caché:    {CACHE_DIR} ({get_dir_security_status(CACHE_DIR)})")
     print(f"  Cuenta activa:          {get_active_alias()}")
     print(f"  Cuenta default:         {get_default_alias()}")
 
@@ -1001,11 +1180,11 @@ def cmd_doctor(args):
     for alias in aliases:
         prof = get_profile_dir(alias)
         auth = get_profile_auth_file(alias)
-        launcher = os.path.join(LOCAL_BIN_DIR, alias)
+        launcher = get_launcher_path(LOCAL_BIN_DIR, alias)
 
         prof_ok = os.path.isdir(prof)
         auth_ok = os.path.isfile(auth)
-        launch_ok = os.path.isfile(launcher) and os.access(launcher, os.X_OK)
+        launch_ok = is_executable(launcher)
 
         status_parts = []
         status_parts.append(f"dir: {'✓' if prof_ok else '✗'}")
@@ -1030,7 +1209,7 @@ def cmd_rm(args):
         sys.exit(1)
 
     prof = get_profile_dir(alias)
-    launcher = os.path.join(LOCAL_BIN_DIR, alias)
+    launcher = get_launcher_path(LOCAL_BIN_DIR, alias)
     cache_file = os.path.join(CACHE_DIR, f"{alias}.json")
 
     confirm = input(f"¿Estás seguro de eliminar el perfil '{alias}' ({prof})? [s/N]: ")
@@ -1071,6 +1250,208 @@ def cmd_rm(args):
 
     sync_launchers()
     print(f"{C_GREEN}✓ Perfil '{alias}' eliminado.{C_RESET}\n")
+
+
+def _extract_auth_identity(auth_data: dict) -> tuple[str | None, str | None]:
+    """Extrae (account_id, email) de un diccionario auth.json sin llamadas de red."""
+    if not isinstance(auth_data, dict):
+        return None, None
+    tokens = auth_data.get("tokens")
+    account_id = tokens.get("account_id") if isinstance(tokens, dict) else None
+    email = auth_data.get("email")
+    return account_id, email
+
+
+def _get_existing_profile_identity(alias: str) -> tuple[str | None, str | None]:
+    """Obtiene (account_id, email) de un perfil local desde auth.json y caché."""
+    account_id = None
+    email = None
+    auth_file = get_profile_auth_file(alias)
+    if os.path.isfile(auth_file):
+        try:
+            with open(auth_file, "r", encoding="utf-8") as f:
+                account_id, email = _extract_auth_identity(json.load(f))
+        except Exception:
+            pass
+    cache_file = os.path.join(CACHE_DIR, f"{alias}.json")
+    if os.path.isfile(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+                account_id = account_id or cached.get("account_id")
+                email = email or cached.get("email")
+        except Exception:
+            pass
+    return account_id, email
+
+
+def cmd_export(args):
+    ensure_auto_migration()
+    available = list_aliases()
+
+    raw_alias = getattr(args, "alias", None)
+    if raw_alias:
+        try:
+            alias = validate_alias(raw_alias)
+        except ValueError as e:
+            print(f"{C_RED}Error:{C_RESET} {e}")
+            sys.exit(1)
+        if alias not in available:
+            print(f"{C_RED}Error:{C_RESET} El alias '{alias}' no existe.")
+            sys.exit(1)
+        target_aliases = [alias]
+        default_out = f"codexc-{alias}.json"
+    else:
+        if not available:
+            print(f"{C_RED}Error:{C_RESET} No hay perfiles configurados para exportar.")
+            sys.exit(1)
+        target_aliases = available
+        default_out = "codexc-accounts-bundle.json"
+
+    accounts_payload = []
+    for alias in target_aliases:
+        auth_file = get_profile_auth_file(alias)
+        if not os.path.isfile(auth_file):
+            print(f"{C_RED}Error:{C_RESET} Falta auth.json en el perfil '{alias}'.")
+            sys.exit(1)
+        try:
+            with open(auth_file, "r", encoding="utf-8") as f:
+                auth_data = json.load(f)
+        except Exception as e:
+            print(f"{C_RED}Error:{C_RESET} No se pudo leer auth.json de '{alias}': {e}")
+            sys.exit(1)
+
+        entry = {"alias": alias, "auth": auth_data}
+        cfg_file = os.path.join(get_profile_dir(alias), "config.toml")
+        if os.path.isfile(cfg_file):
+            try:
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    entry["config_toml"] = f.read()
+            except Exception:
+                pass
+        accounts_payload.append(entry)
+
+    bundle = {
+        "format": "codexc-bundle-v1",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "accounts": accounts_payload,
+    }
+
+    out_path = getattr(args, "output", None) or default_out
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(bundle, f, indent=2)
+    set_private_file_permissions(out_path)
+
+    print(f"\n{C_BOLD}{C_GREEN}✓ Exportación completada:{C_RESET} {out_path} ({len(accounts_payload)} cuenta(s))")
+    print(
+        f"{C_YELLOW}⚠ Advertencia de seguridad:{C_RESET} Este archivo contiene tokens de sesión privados.\n"
+        f"  Transfiérelo únicamente por un canal cifrado (ej. scp) y elimínalo tras importarlo.\n"
+    )
+
+
+def cmd_import(args):
+    ensure_base_dirs()
+    bundle_path = args.file
+    if not os.path.isfile(bundle_path):
+        print(f"{C_RED}Error:{C_RESET} Archivo no encontrado: {bundle_path}")
+        sys.exit(1)
+
+    try:
+        with open(bundle_path, "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+    except Exception as e:
+        print(f"{C_RED}Error:{C_RESET} Archivo JSON inválido: {e}")
+        sys.exit(1)
+
+    if not isinstance(bundle, dict) or bundle.get("format") != "codexc-bundle-v1":
+        print(f"{C_RED}Error:{C_RESET} Formato de bundle no soportado (se esperaba 'codexc-bundle-v1').")
+        sys.exit(1)
+
+    accounts = bundle.get("accounts")
+    if not isinstance(accounts, list) or not accounts:
+        print(f"{C_RED}Error:{C_RESET} El bundle no contiene cuentas para importar.")
+        sys.exit(1)
+
+    rename_alias = getattr(args, "alias", None)
+    if rename_alias and len(accounts) != 1:
+        print(f"{C_RED}Error:{C_RESET} '--alias' solo puede usarse al importar un bundle de exactamente 1 cuenta.")
+        sys.exit(1)
+
+    overwrite = bool(getattr(args, "overwrite", False))
+    existing_aliases = list_aliases()
+    had_profiles_before = bool(existing_aliases)
+
+    imported_aliases = []
+    for entry in accounts:
+        if not isinstance(entry, dict):
+            print(f"{C_RED}Error:{C_RESET} Entrada de cuenta inválida en el bundle.")
+            sys.exit(1)
+
+        raw_alias = rename_alias or entry.get("alias")
+        try:
+            target_alias = validate_alias(raw_alias)
+        except ValueError as e:
+            print(f"{C_RED}Error:{C_RESET} {e}")
+            sys.exit(1)
+
+        auth_data = entry.get("auth")
+        if not isinstance(auth_data, dict) or not auth_data:
+            print(f"{C_RED}Error:{C_RESET} Datos 'auth' inválidos para '{target_alias}'.")
+            sys.exit(1)
+
+        auth_dst = get_profile_auth_file(target_alias)
+        if (target_alias in existing_aliases or os.path.isfile(auth_dst)) and not overwrite:
+            print(f"{C_RED}Error:{C_RESET} El perfil '{target_alias}' ya existe. Usa --overwrite para reemplazarlo.")
+            sys.exit(1)
+
+        new_acc_id, new_email = _extract_auth_identity(auth_data)
+        if not overwrite:
+            for other in existing_aliases:
+                if other == target_alias:
+                    continue
+                other_acc_id, other_email = _get_existing_profile_identity(other)
+                if (new_acc_id and other_acc_id and new_acc_id == other_acc_id) or (
+                    new_email and other_email and new_email.lower() == other_email.lower()
+                ):
+                    print(
+                        f"{C_RED}Error:{C_RESET} La cuenta ya existe en el perfil '{other}'. "
+                        f"Usa --overwrite si deseas actualizarla."
+                    )
+                    sys.exit(1)
+
+        prof_dir = get_profile_dir(target_alias)
+        ensure_private_dir(prof_dir)
+
+        with open(auth_dst, "w", encoding="utf-8") as f:
+            json.dump(auth_data, f, indent=2)
+        set_private_file_permissions(auth_dst)
+
+        cfg_toml = entry.get("config_toml")
+        if isinstance(cfg_toml, str):
+            cfg_dst = os.path.join(prof_dir, "config.toml")
+            if overwrite or not os.path.exists(cfg_dst):
+                with open(cfg_dst, "w", encoding="utf-8") as f:
+                    f.write(cfg_toml)
+                set_private_file_permissions(cfg_dst)
+
+        skills_src = os.path.join(SYSTEM_CODEX_DIR, "skills")
+        skills_dst = os.path.join(prof_dir, "skills")
+        if os.path.isdir(skills_src) and not os.path.exists(skills_dst):
+            create_dir_link(skills_src, skills_dst)
+
+        if target_alias not in existing_aliases:
+            existing_aliases.append(target_alias)
+        imported_aliases.append(target_alias)
+
+    sync_launchers()
+    if not had_profiles_before and imported_aliases:
+        set_active_alias(imported_aliases[0])
+        set_default_alias(imported_aliases[0])
+
+    print(f"\n{C_BOLD}{C_GREEN}✓ Importación completada:{C_RESET} {', '.join(imported_aliases)}\n")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1118,6 +1499,19 @@ def main():
     p_rm = subparsers.add_parser("rm", help="Eliminar un perfil de cuenta")
     p_rm.add_argument("alias", help="Alias a eliminar")
     p_rm.set_defaults(func=cmd_rm)
+
+    # export
+    p_export = subparsers.add_parser("export", help="Exportar perfiles a un bundle JSON portable")
+    p_export.add_argument("alias", nargs="?", help="Alias opcional a exportar (por defecto todos)")
+    p_export.add_argument("-o", "--output", help="Ruta del archivo JSON de salida")
+    p_export.set_defaults(func=cmd_export)
+
+    # import
+    p_import = subparsers.add_parser("import", help="Importar perfiles desde un bundle JSON portable")
+    p_import.add_argument("file", help="Ruta del bundle JSON a importar")
+    p_import.add_argument("--alias", help="Renombrar el alias importado (solo bundles de 1 cuenta)")
+    p_import.add_argument("--overwrite", action="store_true", help="Sobreescribir perfil existente")
+    p_import.set_defaults(func=cmd_import)
 
     # Atajo directo: si el primer argumento es un alias existente, actuar como 'switch'
     if len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
