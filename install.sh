@@ -24,9 +24,14 @@ RESET="\033[0m"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$SCRIPT_DIR/bin"
-REAL_HOME="${CODEX_REAL_HOME:-/home/aidev}"
+RAW_HOME="${CODEX_REAL_HOME:-${HOME:-/home/aidev}}"
+REAL_HOME="${RAW_HOME%%/.codexc_homes*}"
 LOCAL_BIN="$REAL_HOME/.local/bin"
-SKILL_DIR="$REAL_HOME/proyectos/.agents/skills/codexc"
+if [ -d "$REAL_HOME/proyectos/.agents/skills" ]; then
+    SKILL_DIR="$REAL_HOME/proyectos/.agents/skills/codexc"
+else
+    SKILL_DIR="$REAL_HOME/.agents/skills/codexc"
+fi
 
 echo ""
 echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗${RESET}"
@@ -85,15 +90,32 @@ fi
 
 # ── Paso 4: Instalar skill para agentes ────────────────────────────────────────
 echo -e "${BOLD}[4/5] Registrando skill de agente en el sistema...${RESET}"
-if [ -d "$SCRIPT_DIR/skills/codexc" ]; then
+if [ -d "$SCRIPT_DIR/skills/codexc" ] && { [ -d "$REAL_HOME/proyectos/.agents/skills" ] || [ -d "$REAL_HOME/.agents/skills" ]; }; then
     mkdir -p "$SKILL_DIR"
     cp -f "$SCRIPT_DIR/skills/codexc/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null || true
     echo -e "  ${GREEN}✓ Skill codexc sincronizada en:${RESET} ${DIM}$SKILL_DIR${RESET}"
+else
+    echo -e "  ${DIM}ℹ Directorio .agents/skills no encontrado; skill no instalada.${RESET}"
 fi
 
-# ── Paso 5: Sincronizar perfiles y verificar doctor ───────────────────────────
+# ── Paso 5: Configurar PATH, pruebas y doctor ──────────────────────────────────
 echo -e "${BOLD}[5/5] Sincronizando perfiles y lanzadores...${RESET}"
+for rc_file in "$REAL_HOME/.bashrc" "$REAL_HOME/.zshrc"; do
+    if [ -f "$rc_file" ] || { [ "$rc_file" = "$REAL_HOME/.zshrc" ] && [ "${SHELL##*/}" = "zsh" ]; } || { [ "$rc_file" = "$REAL_HOME/.bashrc" ] && [ "${SHELL##*/}" != "zsh" ]; }; then
+        if ! grep -qF '.local/bin' "$rc_file" 2>/dev/null; then
+            echo "" >> "$rc_file"
+            echo "# codexc — multi-account switcher para Codex CLI" >> "$rc_file"
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc_file"
+            echo -e "  ${DIM}PATH añadido a $rc_file${RESET}"
+        fi
+    fi
+done
+
 "$LOCAL_BIN/codexc" doctor >/dev/null 2>&1 || true
+
+if [ -f "$SCRIPT_DIR/tests/test_codexc.py" ]; then
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$SCRIPT_DIR/tests"
+fi
 
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════╗${RESET}"
