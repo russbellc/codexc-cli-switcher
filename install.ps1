@@ -25,30 +25,82 @@ Write-Host ""
 Write-Host "[1/6] Verificando requisitos del sistema..." -ForegroundColor White
 
 $PythonExe = $null
-foreach ($cand in @("python", "python3", "py")) {
-    $cmd = Get-Command $cand -ErrorAction SilentlyContinue
-    if ($cmd) {
-        try {
-            $verArgs = if ($cand -eq "py") { @("-3", "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')") } else { @("-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')") }
-            $verOut = & $cmd.Source @verArgs 2>$null
-            if ($LASTEXITCODE -eq 0 -and $verOut) {
-                $parts = $verOut.Trim().Split(".")
-                $maj = [int]$parts[0]
-                $min = [int]$parts[1]
-                if ($maj -gt 3 -or ($maj -eq 3 -and $min -ge 10)) {
-                    $PythonExe = if ($cand -eq "py") { (& $cmd.Source -3 -c "import sys; print(sys.executable)").Trim() } else { $cmd.Source }
-                    Write-Host "  Python: $verOut ($PythonExe)" -ForegroundColor DarkGray
-                    break
-                }
-            }
-        } catch {}
+$PythonVersion = $null
+$nativePySpecs = [System.Collections.Generic.List[object]]::new()
+$msixPySpecs = [System.Collections.Generic.List[object]]::new()
+$seenPy = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+$addPySpec = {
+    param([string]$ExePath, [string[]]$PreArgs = @())
+    if ([string]::IsNullOrWhiteSpace($ExePath)) { return }
+    $key = "$ExePath|$($PreArgs -join ' ')"
+    if (-not $seenPy.Add($key)) { return }
+    if ($ExePath -match '(?i)\\WindowsApps\\') {
+        $msixPySpecs.Add(@{ Exe = $ExePath; PreArgs = $PreArgs })
+    } else {
+        $nativePySpecs.Add(@{ Exe = $ExePath; PreArgs = $PreArgs })
     }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($RealHome)) {
+    Get-ChildItem -Path (Join-Path $RealHome ".local\bin\python*.exe") -File -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | ForEach-Object { & $addPySpec $_.FullName }
+}
+if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+    Get-ChildItem -Path (Join-Path $env:APPDATA "uv\python\cpython-*\python.exe") -File -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | ForEach-Object { & $addPySpec $_.FullName }
+}
+if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA "Programs\Python\Python*\python.exe") -File -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | ForEach-Object { & $addPySpec $_.FullName }
+}
+foreach ($pat in @("C:\Python*\python.exe", "C:\Program Files\Python*\python.exe")) {
+    Get-ChildItem -Path $pat -File -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | ForEach-Object { & $addPySpec $_.FullName }
+}
+foreach ($cand in @("python", "python3", "py")) {
+    $cmds = Get-Command $cand -All -ErrorAction SilentlyContinue
+    foreach ($c in $cmds) {
+        if (-not $c.Source) { continue }
+        $pre = if ($cand -eq "py") { @("-3") } else { @() }
+        & $addPySpec $c.Source $pre
+    }
+}
+
+$msixFallbackExe = $null
+$msixFallbackVer = $null
+$pyProbe = "import os, sys; assert sys.version_info >= (3, 10); exe = sys.executable if os.path.exists(sys.executable) else ''; print(exe); print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+foreach ($spec in (@($nativePySpecs) + @($msixPySpecs))) {
+    try {
+        $probeArgs = $spec.PreArgs + @("-S", "-c", $pyProbe)
+        $out = & $spec.Exe @probeArgs 2>$null
+        if ($LASTEXITCODE -eq 0 -and $out.Count -ge 2) {
+            $resolvedExe = "$($out[0])".Trim()
+            if (-not $resolvedExe) { $resolvedExe = $spec.Exe }
+            $verStr = "$($out[1])".Trim()
+            if ($resolvedExe -match '(?i)\\WindowsApps\\') {
+                if (-not $msixFallbackExe) {
+                    $msixFallbackExe = $resolvedExe
+                    $msixFallbackVer = $verStr
+                }
+                continue
+            }
+            $PythonExe = $resolvedExe
+            $PythonVersion = $verStr
+            break
+        }
+    } catch {}
+}
+if (-not $PythonExe -and $msixFallbackExe) {
+    $PythonExe = $msixFallbackExe
+    $PythonVersion = $msixFallbackVer
 }
 
 if (-not $PythonExe) {
     Write-Host "X Python 3.10+ no encontrado. Instala Python 3.10 o superior." -ForegroundColor Red
     exit 1
 }
+Write-Host "  Python: $PythonVersion ($PythonExe)" -ForegroundColor DarkGray
 
 # Detectar binario real de Codex (.exe / .cmd, nunca .ps1 ni wrapper propio)
 $CodexBin = $null

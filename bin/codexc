@@ -724,6 +724,34 @@ fi
 """
 
 
+def _is_msix_windows_python(path: str) -> bool:
+    return "\\windowsapps\\" in (path or "").replace("/", "\\").lower()
+
+
+def _resolve_windows_python_exe() -> str:
+    """Resuelve Python nativo en Windows evitando contenedores MSIX (WindowsApps)."""
+    cur = sys.executable or ""
+    if cur and os.path.isfile(cur) and not _is_msix_windows_python(cur):
+        return cur
+    appdata = os.environ.get("APPDATA", "").strip() or os.path.join(REAL_HOME, "AppData", "Roaming")
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip() or os.path.join(REAL_HOME, "AppData", "Local")
+    patterns = [
+        os.path.join(REAL_HOME, ".local", "bin", "python3.*.exe"),
+        os.path.join(REAL_HOME, ".local", "bin", "python.exe"),
+        os.path.join(appdata, "uv", "python", "cpython-*", "python.exe"),
+        os.path.join(localappdata, "Programs", "Python", "Python*", "python.exe"),
+        r"C:\Python*\python.exe",
+        r"C:\Program Files\Python*\python.exe",
+    ]
+    import glob
+
+    for pat in patterns:
+        for cand in sorted(glob.glob(pat), reverse=True):
+            if os.path.isfile(cand) and not _is_msix_windows_python(cand):
+                return cand
+    return cur or "python"
+
+
 def sync_launchers():
     """Sincroniza binarios lanzadores sin escrituras redundantes ni sobreescritura de symlinks ajenos."""
     ensure_base_dirs()
@@ -772,9 +800,10 @@ def sync_launchers():
 
         # 3. Lanzador global codexc.cmd
         codexc_cmd_path = os.path.join(LOCAL_BIN_DIR, "codexc.cmd")
+        py_exe = _resolve_windows_python_exe()
         codexc_cmd_content = (
             "@echo off\n"
-            f'"{sys.executable}" "{current_script}" %*\n'
+            f'"{py_exe}" "{current_script}" %*\n'
         )
         _write_launcher_if_changed(codexc_cmd_path, codexc_cmd_content, newline="\r\n")
         return
